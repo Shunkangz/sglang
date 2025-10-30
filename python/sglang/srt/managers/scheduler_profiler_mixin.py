@@ -279,6 +279,36 @@ class SchedulerProfilerMixin:
         return ProfileReqOutput(success=True, message=f"Succeeded.{merge_message}")
 
     def _profile_batch_predicate(self, batch):
+        from sglang.srt.utils import get_int_env_var
+        if not hasattr(self, "nsys_profile_target_prefill_ct"):
+            self.nsys_profile_target_prefill_ct = get_int_env_var("SGLANG_NSYS_PROFILE_PREFILL_CT", 0)
+            self.nsys_profile_target_decode_ct = get_int_env_var("SGLANG_NSYS_PROFILE_DECODE_CT", 0)
+            self.nsys_profile_prefill_ct = 0
+            self.nsys_profile_decode_ct = 0
+            self.nsys_profile_prefill_in_progress = False
+            self.nsys_profile_decode_in_progress = False
+
+        if batch.forward_mode.is_decode() and self.nsys_profile_target_decode_ct > 0:
+            if self.nsys_profile_decode_ct == 0:
+                torch.cuda.nvtx.range_push("decoding start")
+                torch.cuda.cudart().cudaProfilerStart()
+                self.nsys_profile_decode_in_progress = True
+            self.nsys_profile_decode_ct += 1
+            if self.nsys_profile_decode_ct > self.nsys_profile_target_decode_ct and self.nsys_profile_decode_in_progress:
+                torch.cuda.nvtx.range_pop()
+                torch.cuda.cudart().cudaProfilerStop()
+                self.nsys_profile_decode_in_progress = False
+        elif batch.forward_mode.is_prefill() and self.nsys_profile_target_prefill_ct > 0:
+            if self.nsys_profile_prefill_ct == 0:
+                torch.cuda.nvtx.range_push("prefill start")
+                torch.cuda.cudart().cudaProfilerStart()
+                self.nsys_profile_prefill_in_progress = True
+            self.nsys_profile_prefill_ct += 1
+            if self.nsys_profile_prefill_ct > self.nsys_profile_target_prefill_ct and self.nsys_profile_prefill_in_progress:
+                torch.cuda.nvtx.range_pop()
+                torch.cuda.cudart().cudaProfilerStop()
+                self.nsys_profile_prefill_in_progress = False
+
         if self.profile_by_stage:
             if batch.forward_mode.is_prefill():
                 if self.profiler_prefill_ct == 0:

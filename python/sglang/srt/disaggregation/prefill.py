@@ -26,6 +26,7 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Type
 
 import torch
+import nvtx
 
 from sglang.srt.disaggregation.base import BaseKVManager, KVPoll
 from sglang.srt.disaggregation.utils import (
@@ -315,13 +316,17 @@ class SchedulerDisaggregationPrefillMixin:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
 
         while True:
-            recv_reqs = self.recv_requests()
-            self.process_input_requests(recv_reqs)
-            self.waiting_queue.extend(
+            with nvtx.annotate("process_input_requests"):
+                recv_reqs = self.recv_requests()
+                self.process_input_requests(recv_reqs)
+            with nvtx.annotate("bootstrapped"):
+                self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
-            self.process_prefill_chunk()
-            batch = self.get_new_batch_prefill()
+            with nvtx.annotate("process_prefill_chunk"):
+                self.process_prefill_chunk()
+            with nvtx.annotate("get_new_batch_prefill"):
+                batch = self.get_new_batch_prefill()
             if batch:
                 attrs = {"bid": hex(id(batch)), "batch_size": batch.batch_size()}
                 trace_event_batch("schedule", batch.reqs, attrs=attrs)
@@ -331,11 +336,14 @@ class SchedulerDisaggregationPrefillMixin:
             self.cur_batch = batch
 
             if batch:
-                result = self.run_batch(batch)
-                self.process_batch_result_disagg_prefill(batch, result)
+                with nvtx.annotate("run_batch"):
+                    result = self.run_batch(batch)
+                with nvtx.annotate("process_batch_result_disagg_prefill"):
+                    self.process_batch_result_disagg_prefill(batch, result)
 
             if len(self.disagg_prefill_inflight_queue) > 0:
-                self.process_disagg_prefill_inflight_queue()
+                with nvtx.annotate("process_disagg_prefill_inflight_queue"):
+                    self.process_disagg_prefill_inflight_queue()
 
             if batch is None and len(self.disagg_prefill_inflight_queue) == 0:
                 self.self_check_during_idle()
