@@ -2,9 +2,18 @@ import logging
 from typing import Optional, Tuple
 
 import torch
-import torch.distributed as dist
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.distributed import (
+    get_attn_tensor_model_parallel_rank,
+    get_attn_tensor_model_parallel_world_size,
+    get_attn_tp_group,
+    get_moe_ep_group,
+    get_moe_expert_parallel_rank,
+    get_moe_expert_parallel_world_size,
+    get_moe_tensor_parallel_rank,
+    get_moe_tensor_parallel_world_size,
+    get_moe_tp_group,
+)
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -31,6 +40,7 @@ class FlashInferWorkspaceManager:
         self.ipc_handles = None
         self.world_size = None
         self.rank = None
+        self.group = None
         self.initialized = False
 
     def initialize(
@@ -43,7 +53,11 @@ class FlashInferWorkspaceManager:
         use_fp32_lamport: bool = False,
     ):
         """Initialize workspace"""
-        if self.initialized and self.world_size == world_size:
+        # IMPORTANT: the workspace depends not only on `world_size`, but also on
+        # the *exact set/order* of participating ranks. When multiple subgroups
+        # share the same size (e.g. TP2 with multiple TP groups), reusing a
+        # workspace across groups will corrupt results or hang.
+        if self.initialized and self.world_size == world_size and self.group == group:
             return
 
         if _flashinfer_comm is None:
@@ -68,6 +82,7 @@ class FlashInferWorkspaceManager:
         self.world_size = world_size
         self.rank = rank
         self.initialized = True
+        self.group = group
 
         logger.info(
             f"FlashInfer workspace initialized for rank {rank}, "
@@ -79,13 +94,14 @@ class FlashInferWorkspaceManager:
         if self.initialized and self.ipc_handles is not None:
             try:
                 _flashinfer_comm.trtllm_destroy_ipc_workspace_for_all_reduce(
-                    self.ipc_handles, group=dist.group.WORLD
+                    self.ipc_handles, group=self.group
                 )
             except Exception as e:
                 logger.warning(f"Failed to cleanup FlashInfer workspace: {e}")
             finally:
                 self.workspace_tensor = None
                 self.ipc_handles = None
+                self.group = None
                 self.initialized = False
 
 
@@ -93,17 +109,41 @@ _workspace_manager = FlashInferWorkspaceManager()
 
 
 def ensure_workspace_initialized(
-    max_token_num: int = 2048, hidden_dim: int = 4096, use_fp32_lamport: bool = False
+    max_token_num: int = 2048,
+    hidden_dim: int = 4096,
+    use_fp32_lamport: bool = False,
+    use_attn_tp_group: bool = True,
 ):
-    """Ensure workspace is initialized"""
+    """Ensure workspace is initialized
+
+    Args:
+        max_token_num: Maximum token number
+        hidden_dim: Hidden dimension
+        use_fp32_lamport: Whether to use fp32 for lamport
+        use_attn_tp_group: If True, use attention TP group; otherwise use MoE TP group
+    """
     if not is_flashinfer_available() or _flashinfer_comm is None:
         return False
 
-    world_size = get_tensor_model_parallel_world_size()
+    if use_attn_tp_group:
+        world_size = get_attn_tensor_model_parallel_world_size()
+        rank = get_attn_tensor_model_parallel_rank()
+        group = get_attn_tp_group().device_group
+    else:
+        # If MoE expert parallel world size > 1, use expert parallel group
+        # Otherwise, use tensor parallel group
+        # The two values cannot be larger than 1 at the same time
+        if get_moe_expert_parallel_world_size() > 1:
+            world_size = get_moe_expert_parallel_world_size()
+            rank = get_moe_expert_parallel_rank()
+            group = get_moe_ep_group().device_group
+        else:
+            world_size = get_moe_tensor_parallel_world_size()
+            rank = get_moe_tensor_parallel_rank()
+            group = get_moe_tp_group().device_group
+
     if world_size <= 1:
         return False
-
-    rank = dist.get_rank()
 
     if (
         not _workspace_manager.initialized
@@ -114,6 +154,7 @@ def ensure_workspace_initialized(
             rank=rank,
             max_token_num=max_token_num,
             hidden_dim=hidden_dim,
+            group=group,
             use_fp32_lamport=use_fp32_lamport,
         )
 
@@ -129,6 +170,7 @@ def fake_flashinfer_allreduce_residual_rmsnorm(
     use_oneshot: Optional[bool] = None,
     trigger_completion_at_end: bool = False,
     fp32_acc: bool = False,
+    use_attn_tp_group: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     residual_out = torch.empty_like(residual)
     norm_out = torch.empty_like(input_tensor)
@@ -148,6 +190,7 @@ def flashinfer_allreduce_residual_rmsnorm(
     use_oneshot: Optional[bool] = None,
     trigger_completion_at_end: bool = False,
     fp32_acc: bool = False,
+    use_attn_tp_group: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Use FlashInfer's fused allreduce + residual + RMS norm operation
@@ -161,6 +204,7 @@ def flashinfer_allreduce_residual_rmsnorm(
         use_oneshot: Whether to use oneshot mode
         trigger_completion_at_end: Whether to trigger completion at end
         fp32_acc: Whether to use fp32 precision
+        use_attn_tp_group: If True, use attention TP group; otherwise use MoE TP group
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: (norm_output, residual_output)
@@ -171,7 +215,20 @@ def flashinfer_allreduce_residual_rmsnorm(
         )
         return None, None
 
-    world_size = get_tensor_model_parallel_world_size()
+    if use_attn_tp_group:
+        world_size = get_attn_tensor_model_parallel_world_size()
+        world_rank = get_attn_tensor_model_parallel_rank()
+    else:
+        # If MoE expert parallel world size > 1, use expert parallel group
+        # Otherwise, use tensor parallel group
+        # The two values cannot be larger than 1 at the same time
+        if get_moe_expert_parallel_world_size() > 1:
+            world_size = get_moe_expert_parallel_world_size()
+            world_rank = get_moe_expert_parallel_rank()
+        else:
+            world_size = get_moe_tensor_parallel_world_size()
+            world_rank = get_moe_tensor_parallel_rank()
+
     if world_size <= 1:
         logger.debug("Single GPU, no need for allreduce fusion")
         return None, None
@@ -182,6 +239,7 @@ def flashinfer_allreduce_residual_rmsnorm(
         max_token_num=max_token_num,
         hidden_dim=input_tensor.shape[-1],
         use_fp32_lamport=(input_tensor.dtype == torch.float32),
+        use_attn_tp_group=use_attn_tp_group,
     ):
         logger.debug("FlashInfer workspace not available")
         return None, None
@@ -194,7 +252,7 @@ def flashinfer_allreduce_residual_rmsnorm(
     _flashinfer_comm.trtllm_allreduce_fusion(
         allreduce_in=input_tensor,
         world_size=world_size,
-        world_rank=dist.get_rank(),
+        world_rank=world_rank,
         token_num=token_num,
         hidden_dim=hidden_dim,
         workspace_ptrs=_workspace_manager.workspace_tensor,

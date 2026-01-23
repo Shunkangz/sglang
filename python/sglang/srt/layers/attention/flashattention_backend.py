@@ -10,7 +10,9 @@ import triton.language as tl
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.dp_attention import get_attention_cp_rank
 from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
@@ -339,6 +341,7 @@ class FlashAttentionBackend(AttentionBackend):
         self.page_size = model_runner.page_size
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.skip_prefill = skip_prefill
+        self.attn_cp_size = model_runner.attn_cp_size
 
         self.use_sliding_window_kv_pool = (
             isinstance(model_runner.token_to_kv_pool, SWAKVPool)
@@ -611,6 +614,9 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
+            # if forward_batch.forward_mode.is_context_parallel_extend() and self.attn_cp_size > 1:
+            #     metadata.cache_seqlens_int32 = forward_batch.attn_cp_metadata.cache_seqlens_int32
+            #     metadata.cu_seqlens_k = forward_batch.attn_cp_metadata.cu_seqlens_k
 
             if any(
                 forward_batch.extend_prefix_lens_cpu
@@ -729,7 +735,20 @@ class FlashAttentionBackend(AttentionBackend):
     ):
         if k is not None:
             assert v is not None
-            if save_kv_cache:
+
+            # DEBUG: Print KV cache info for both CP and non-CP cases
+            is_cp_mode = (
+                forward_batch.forward_mode.is_context_parallel_extend()
+                and forward_batch.attn_cp_metadata is not None
+                and self.attn_cp_size > 1
+            )
+
+            # if forward_batch.forward_mode.is_extend() and layer.layer_id in [0, 1]:  # Print for first two layers
+            #     mode_str = "CP" if is_cp_mode else "non-CP"
+            #     print(f"[KV CACHE] {mode_str} Rank {torch.distributed.get_rank()} layer {layer.layer_id}: k shape: {k.shape}, v shape: {v.shape}", flush=True)
+            #     print(f"[KV CACHE] {mode_str} Rank {torch.distributed.get_rank()} layer {layer.layer_id} k values (first 3 tokens, first head, first 5 dims): {k[:3, 0, :5]}", flush=True)
+
+            if save_kv_cache and not is_cp_mode:
                 cache_loc = (
                     forward_batch.out_cache_loc
                     if not layer.is_cross_attention
@@ -746,6 +765,49 @@ class FlashAttentionBackend(AttentionBackend):
                         k,
                         k_rope,
                     )
+            # When enable context parallelism, we need to all gather the kv cache from other ranks
+            # and save the kv cache to the memory pool.
+            if is_cp_mode:
+
+                # Get the cache_loc that will be used for writing
+                cache_loc = (
+                    forward_batch.out_cache_loc
+                    if not layer.is_cross_attention
+                    else forward_batch.encoder_out_cache_loc
+                )
+
+                # Allgather and reorganize key and value caches
+                k = k.contiguous()
+                v = v.contiguous()
+
+                key_cache_full = cp_all_gather_rerange_kv_cache(
+                    k, self.attn_cp_size, forward_batch, torch.cuda.current_stream()
+                )
+                value_cache_full = cp_all_gather_rerange_kv_cache(
+                    v, self.attn_cp_size, forward_batch, torch.cuda.current_stream()
+                )
+
+                # if layer.layer_id in [0, 1]:  # Print for first two layers
+                #     print(
+                #         f"[KV CACHE] CP Rank {torch.distributed.get_rank()} layer {layer.layer_id} after allgather key_cache_full shape: {key_cache_full.shape}, value_cache_full shape: {value_cache_full.shape}", flush=True
+                #     )
+                #     print(
+                #         f"[KV CACHE] CP Rank {torch.distributed.get_rank()} layer {layer.layer_id} key_cache_full values (first 3 tokens, first head, first 5 dims): {key_cache_full[:3, 0, :5]}", flush=True
+                #     )
+
+                # Each rank writes the full KV cache to its own local memory pool.
+                # All ranks need the full sequence KV for subsequent decode steps.
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer,
+                    cache_loc,
+                    key_cache_full,
+                    value_cache_full,
+                    layer.k_scale,
+                    layer.v_scale,
+                )
+                # print(
+                #     f"DEBUG: Rank {torch.distributed.get_rank()} wrote full KV cache to local memory pool"
+                # )
 
         # Use precomputed metadata across all layers
         metadata = self.forward_metadata
@@ -837,6 +899,7 @@ class FlashAttentionBackend(AttentionBackend):
             key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id
             )
+
             key_cache = key_cache.view(
                 -1, self.page_size, layer.tp_k_head_num, layer.head_dim
             )
@@ -849,25 +912,184 @@ class FlashAttentionBackend(AttentionBackend):
                 cu_seqlens_k = metadata.encoder_cu_seqlens_k
                 window_size = (-1, -1)
 
-            result = flash_attn_with_kvcache(
-                q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                k_cache=key_cache,
-                v_cache=value_cache,
-                page_table=page_table,
-                cache_seqlens=cache_seqlens,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
-                max_seqlen_q=max_seqlen_q,
-                softmax_scale=layer.scaling,
-                causal=False if use_cascade_attn else causal,
-                window_size=window_size,
-                softcap=layer.logit_cap,
-                k_descale=k_descale,
-                v_descale=v_descale,
-                return_softmax_lse=use_cascade_attn,
-                num_splits=self.num_splits,
-                **kwargs,
-            )
+            if (
+                forward_batch.forward_mode.is_context_parallel_extend()
+                and forward_batch.attn_cp_metadata is not None
+                and self.attn_cp_size > 1
+            ):
+                q_prev, q_next = torch.chunk(
+                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    2,
+                    dim=0,
+                )
+
+                cp_rank = get_attention_cp_rank()
+                print(f"[Rank {cp_rank}] DEBUG: cu_seqlens_q: {cu_seqlens_q}")
+
+                # TODO: should fix with multi-batch
+                cu_seqlens_q_split = cu_seqlens_q // 4
+                torch.cuda.synchronize()
+
+                # Debug: print inputs for result_prev
+                # print(f"[Rank {cp_rank}] [CP Attention - result_prev] Inputs:")
+                # print(f"[Rank {cp_rank}]   q_prev.shape: {q_prev.shape}")
+                # print(f"[Rank {cp_rank}]   prev_key_cache.shape: {key_cache.shape}")
+                # print(f"[Rank {cp_rank}]   prev_value_cache.shape: {value_cache.shape}")
+                # print(f"[Rank {cp_rank}]   prev_page_table.shape: {page_table.shape}")
+                # print(f"[Rank {cp_rank}]   prev_cache_seqlens: {forward_batch.attn_cp_metadata.kv_len_prev_tensor}")
+                # print(f"[Rank {cp_rank}]   prev_cu_seqlens_q: {cu_seqlens_q_split}")
+                # print(f"[Rank {cp_rank}]   prev_cu_seqlens_k_new: {cu_seqlens_k if not use_local_attn else None}")
+                # print(f"[Rank {cp_rank}]   prev_max_seqlen_q: {forward_batch.attn_cp_metadata.actual_seq_q_prev}")
+                # print(f"[Rank {cp_rank}]   prev_causal: {False if use_cascade_attn else causal}")
+                # print(f"[Rank {cp_rank}]   prev_window_size: {window_size}")
+
+                cu_seqlens_q_prev = torch.tensor(
+                    [0, forward_batch.attn_cp_metadata.actual_seq_q_prev],
+                    device=self.device,
+                    dtype=torch.int32,
+                )
+                # print(f"[Rank {cp_rank}] DEBUG: cu_seqlens_q_prev: {cu_seqlens_q_prev}")
+
+                # VERIFICATION: Read back KV cache using page_table to verify it matches what we saved
+                # print(f"[Rank {cp_rank}] VERIFICATION: Checking KV cache retrieval")
+
+                # # Get the full sequence length from cache_seqlens (total tokens in this batch item)
+                # full_seq_len = cache_seqlens[0].item()
+                # print(f"[Rank {cp_rank}]   full_seq_len (from cache_seqlens): {full_seq_len}")
+                # print(f"[Rank {cp_rank}]   kv_len_prev (for attention): {forward_batch.attn_cp_metadata.kv_len_prev_tensor[0].item()}")
+                # print(f"[Rank {cp_rank}]   page_table shape: {page_table.shape}, page_table[0, :10]: {page_table[0, :10]}")
+                # print(f"[Rank {cp_rank}]   key_cache shape: {key_cache.shape}")
+
+                # Extract FULL KV from cache using page_table indices (simulating what flash_attn does)
+                # if self.page_size == 1:
+                #     # Direct indexing: page_table contains the actual cache locations for the full sequence
+                #     cache_indices = page_table[0, :full_seq_len]
+                #     retrieved_k = key_cache[cache_indices, 0, :, :]  # [full_seq_len, num_heads, head_dim]
+                #     print(f"[Rank {cp_rank}]   cache_indices (full sequence): {cache_indices}")
+                #     print(f"[Rank {cp_rank}]   Retrieved K shape: {retrieved_k.shape}")
+                #     print(f"[Rank {cp_rank}]   Retrieved K values (all tokens, first head, first 3 dims):")
+                #     for i in range(retrieved_k.shape[0]):
+                #         print(f"[Rank {cp_rank}]     Token {i}: {retrieved_k[i, 0, :3]}")
+
+                #     # Load what we saved earlier and compare
+                #     try:
+                #         saved_k_full = torch.load(f"key_cache_full_{torch.distributed.get_rank()}.pt")
+                #         print(f"[Rank {cp_rank}]   Saved K shape: {saved_k_full.shape}")
+                #         print(f"[Rank {cp_rank}]   Saved K values (all tokens, first head, first 3 dims):")
+                #         for i in range(saved_k_full.shape[0]):
+                #             print(f"[Rank {cp_rank}]     Token {i}: {saved_k_full[i, 0, :3]}")
+
+                #         # Compare the full sequences
+                #         compare_len = min(full_seq_len, saved_k_full.shape[0], retrieved_k.shape[0])
+                #         retrieved_to_compare = retrieved_k[:compare_len]
+                #         saved_to_compare = saved_k_full[:compare_len]
+
+                #         matches = torch.allclose(retrieved_to_compare, saved_to_compare, rtol=1e-2, atol=1e-2)
+                #         print(f"[Rank {cp_rank}]   ✓ FULL SEQUENCE KV cache matches saved data ({compare_len} tokens): {matches}")
+                #         if not matches:
+                #             print(f"[Rank {cp_rank}]   ✗ WARNING: Retrieved KV does NOT match saved data!")
+                #             diff = (retrieved_to_compare - saved_to_compare).abs()
+                #             print(f"[Rank {cp_rank}]   Max diff: {diff.max()}, Mean diff: {diff.mean()}")
+                #             # Print per-token max difference
+                #             for i in range(compare_len):
+                #                 token_diff = diff[i].max()
+                #                 print(f"[Rank {cp_rank}]     Token {i} max diff: {token_diff}")
+                #     except Exception as e:
+                #         print(f"[Rank {cp_rank}]   Could not load saved KV for comparison: {e}")
+                #         import traceback
+                #         traceback.print_exc()
+                # else:
+                #     print(f"[Rank {cp_rank}]   Skipping verification for paged attention (page_size={self.page_size})")
+
+                # exit()
+                result_prev = flash_attn_with_kvcache(
+                    q=q_prev,
+                    k_cache=key_cache,
+                    v_cache=value_cache,
+                    page_table=page_table,
+                    cache_seqlens=forward_batch.attn_cp_metadata.kv_len_prev_tensor,
+                    cu_seqlens_q=cu_seqlens_q_prev,
+                    cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
+                    max_seqlen_q=forward_batch.attn_cp_metadata.actual_seq_q_prev,  # int, not tensor
+                    softmax_scale=layer.scaling,
+                    causal=False if use_cascade_attn else causal,
+                    window_size=window_size,
+                    softcap=layer.logit_cap,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                    return_softmax_lse=use_cascade_attn,
+                    num_splits=self.num_splits,
+                    **kwargs,
+                )
+
+                torch.cuda.synchronize()
+                # Debug: print inputs for result_next
+                # print(f"[Rank {cp_rank}] [CP Attention - result_next] Inputs:")
+                # print(f"[Rank {cp_rank}]   q_next.shape: {q_next.shape}")
+                # print(f"[Rank {cp_rank}]   next_key_cache.shape: {key_cache.shape}")
+                # print(f"[Rank {cp_rank}]   next_value_cache.shape: {value_cache.shape}")
+                # print(f"[Rank {cp_rank}]   next_page_table.shape: {page_table.shape}")
+                # print(f"[Rank {cp_rank}]   next_cache_seqlens: {forward_batch.attn_cp_metadata.kv_len_next_tensor}")
+                # print(f"[Rank {cp_rank}]   next_cu_seqlens_q: {cu_seqlens_q_split}")
+                # print(f"[Rank {cp_rank}]   next_cu_seqlens_k_new: {cu_seqlens_k if not use_local_attn else None}")
+                # print(f"[Rank {cp_rank}]   next_max_seqlen_q: {forward_batch.attn_cp_metadata.actual_seq_q_next}")
+                # print(f"[Rank {cp_rank}]   next_causal: {False if use_cascade_attn else causal}")
+                # print(f"[Rank {cp_rank}]   next_window_size: {window_size}")
+
+                cu_seqlens_q_next = torch.tensor(
+                    [0, forward_batch.attn_cp_metadata.actual_seq_q_next],
+                    device=self.device,
+                    dtype=torch.int32,
+                )
+                # print(f"[Rank {cp_rank}] DEBUG: cu_seqlens_q_next: {cu_seqlens_q_next}")
+                result_next = flash_attn_with_kvcache(
+                    q=q_next,
+                    k_cache=key_cache,
+                    v_cache=value_cache,
+                    page_table=page_table,
+                    cache_seqlens=forward_batch.attn_cp_metadata.kv_len_next_tensor,
+                    cu_seqlens_q=cu_seqlens_q_next,
+                    cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
+                    max_seqlen_q=forward_batch.attn_cp_metadata.actual_seq_q_next,  # int, not tensor
+                    softmax_scale=layer.scaling,
+                    causal=False if use_cascade_attn else causal,
+                    window_size=window_size,
+                    softcap=layer.logit_cap,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                    return_softmax_lse=use_cascade_attn,
+                    num_splits=self.num_splits,
+                    **kwargs,
+                )
+
+                # torch.cuda.synchronize()
+                result = torch.concat([result_prev, result_next], dim=0)
+                result = result.contiguous()
+                # print(f"[Rank {cp_rank}] DEBUG: result", result.shape, flush=True)
+                # print(f"[Rank {cp_rank}] DEBUG: result_prev", result_prev.shape, flush=True)
+                # print(f"[Rank {cp_rank}] DEBUG: result_next", result_next.shape, flush=True)
+                torch.cuda.synchronize()
+
+            else:
+                result = flash_attn_with_kvcache(
+                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k_cache=key_cache,
+                    v_cache=value_cache,
+                    page_table=page_table,
+                    cache_seqlens=cache_seqlens,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
+                    max_seqlen_q=max_seqlen_q,
+                    softmax_scale=layer.scaling,
+                    causal=False if use_cascade_attn else causal,
+                    window_size=window_size,
+                    softcap=layer.logit_cap,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                    return_softmax_lse=use_cascade_attn,
+                    num_splits=self.num_splits,
+                    **kwargs,
+                )
 
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
