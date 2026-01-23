@@ -302,17 +302,40 @@ class RMSNorm(MultiPlatformOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
+        use_attn_tp_group: bool = True,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Forward method with allreduce fusion, prioritizing flashinfer fused operations
+
+        Args:
+            x: Input tensor
+            residual: Residual tensor
+            post_residual_addition: Optional post-residual addition tensor
+            use_attn_tp_group: If True, use attention TP group; otherwise use MoE TP group
         """
         if residual is not None:
-            from sglang.srt.distributed import get_tensor_model_parallel_world_size
+            from sglang.srt.distributed import (
+                get_attn_tensor_model_parallel_world_size,
+                get_moe_expert_parallel_world_size,
+                get_moe_tensor_parallel_world_size,
+            )
             from sglang.srt.layers.flashinfer_comm_fusion import (
                 flashinfer_allreduce_residual_rmsnorm,
             )
 
-            if get_tensor_model_parallel_world_size() > 1:
+            # If using attention TP group, use attention TP world size
+            # Otherwise, prioritize MoE expert parallel if its world size > 1
+            # Otherwise, use MoE tensor parallel
+            # The two MoE values cannot be larger than 1 at the same time
+            if use_attn_tp_group:
+                world_size = get_attn_tensor_model_parallel_world_size()
+            else:
+                if get_moe_expert_parallel_world_size() > 1:
+                    world_size = get_moe_expert_parallel_world_size()
+                else:
+                    world_size = get_moe_tensor_parallel_world_size()
+
+            if world_size > 1:
                 if post_residual_addition is not None:
                     residual = residual + post_residual_addition
                 fused_result = flashinfer_allreduce_residual_rmsnorm(
@@ -320,6 +343,7 @@ class RMSNorm(MultiPlatformOp):
                     residual=residual,
                     weight=self.weight,
                     eps=self.variance_epsilon,
+                    use_attn_tp_group=use_attn_tp_group,
                 )
                 if fused_result[0] is not None:
                     return fused_result

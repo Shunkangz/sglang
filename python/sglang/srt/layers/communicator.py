@@ -21,6 +21,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.distributed import (
+    attention_tensor_model_parallel_all_reduce,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
@@ -119,6 +120,7 @@ class ScatterMode(Enum):
         """The scatter mode for model forward pass input and output data"""
         if is_nsa_enable_prefill_cp():
             return ScatterMode.SCATTERED
+
         return ScatterMode.TP_ATTN_FULL
 
 
@@ -283,15 +285,15 @@ class LayerScatterModes:
     @classmethod
     def _compute_mlp_mode(cls, context: _LayerModeComputationContext):
         if context.is_layer_sparse:
-            return (
-                ScatterMode.SCATTERED
-                if (
-                    # Token dispatch/combine will be handled outside of LayerCommunicator for these modes.
-                    not get_moe_a2a_backend().is_none()
-                    or should_use_flashinfer_cutlass_moe_fp4_allgather()
-                )
-                else ScatterMode.FULL
-            )
+            # When using specialized MoE backends (a2a or FP4), they handle token dispatch/combine
+            if (
+                not get_moe_a2a_backend().is_none()
+                or should_use_flashinfer_cutlass_moe_fp4_allgather()
+            ):
+                return ScatterMode.SCATTERED
+
+            # Without CP, use FULL mode (gather across all DP groups)
+            return ScatterMode.FULL
         else:
             return (
                 ScatterMode.SCATTERED
@@ -432,7 +434,7 @@ class LayerCommunicator:
             ):
                 hidden_states, residual = (
                     self.input_layernorm.forward_with_allreduce_fusion(
-                        hidden_states, residual
+                        hidden_states, residual, use_attn_tp_group=False
                     )
                 )
             else:
@@ -635,7 +637,9 @@ class CommunicateContext:
             ScatterMode.SCATTERED: 1,
             ScatterMode.TP_ATTN_FULL: attn_tp_size,
             # TODO: support --moe-dense-tp-size > 1
-            ScatterMode.FULL: tp_size,
+            # With context parallel enabled, we should exclude
+            # the attn_cp_size from the total tp_size
+            ScatterMode.FULL: tp_size // attn_cp_size,
         }
         return cls(
             process_group_sizes=process_group_sizes,
@@ -810,11 +814,14 @@ class CommunicateWithAllReduceAndLayerNormFn:
             if apply_flashinfer_allreduce_fusion(hidden_states.shape[0]) and hasattr(
                 layernorm, "forward_with_allreduce_fusion"
             ):
+                # Use standard TP group (MLP/MoE) for allreduce fusion in postprocess_layer
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(
-                    hidden_states, residual
+                    hidden_states, residual, use_attn_tp_group=True
                 )
             else:
-                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                hidden_states = attention_tensor_model_parallel_all_reduce(
+                    hidden_states
+                )
                 if _is_npu and context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
                 hidden_states, residual = layernorm(hidden_states, residual)
