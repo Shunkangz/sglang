@@ -158,6 +158,8 @@ RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton"]
 
 NSA_PREFILL_CP_SPLIT_CHOICES = ["in-seq-split", "round-robin-split"]
 
+PREFILL_CP_SPLIT_CHOICES = ["in-seq-split"]
+
 DEFAULT_LORA_EVICTION_POLICY = "lru"
 
 NSA_CHOICES = [
@@ -663,6 +665,10 @@ class ServerArgs:
     enable_fused_qk_norm_rope: bool = False
     enable_precise_embedding_interpolation: bool = False
     enable_fused_moe_sum_all_reduce: bool = False
+
+    # Context parallelism
+    enable_prefill_context_parallel: bool = False
+    prefill_cp_mode: str = "in-seq-split"
 
     # Dynamic batch tokenizer
     enable_dynamic_batch_tokenizer: bool = False
@@ -5383,6 +5389,18 @@ class ServerArgs:
             choices=NSA_PREFILL_CP_SPLIT_CHOICES,
             help="Token splitting mode for the prefill phase of DeepSeek v3.2 under context parallelism. Optional values: 'round-robin-split'(default), 'in-seq-split'  "
             "'round-robin-split' distributes tokens across ranks based on token_idx %% cp_size. It supports multi-batch prefill, fused MoE, and FP8 KV cache.",
+        )
+        parser.add_argument(
+            "--enable-prefill-context-parallel",
+            action="store_true",
+            help="Enable context parallelism used in the prefill phase",
+        )
+        parser.add_argument(
+            "--prefill-cp-mode",
+            type=str,
+            default=ServerArgs.prefill_cp_mode,
+            choices=PREFILL_CP_SPLIT_CHOICES,
+            help="Token splitting mode for the prefill phase under context parallelism. Optional values: 'in-seq-split' (default)",
         )
         parser.add_argument(
             "--enable-fused-qk-norm-rope",
