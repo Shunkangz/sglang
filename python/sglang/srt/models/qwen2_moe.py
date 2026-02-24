@@ -27,7 +27,7 @@ from transformers import PretrainedConfig
 
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
-    get_moe_context_model_parallel_world_size,
+    get_moe_data_parallel_world_size,
     get_moe_expert_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_world_size,
@@ -577,7 +577,7 @@ class Qwen2MoeModel(nn.Module):
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
 
-        self.moe_cp_size = get_moe_context_model_parallel_world_size()
+        self.moe_dp_size = get_moe_data_parallel_world_size()
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -699,7 +699,7 @@ class Qwen2MoeModel(nn.Module):
         ):
             hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
-                self.moe_cp_size,
+                self.moe_dp_size,
                 forward_batch,
                 torch.cuda.current_stream(),
             )

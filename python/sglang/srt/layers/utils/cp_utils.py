@@ -197,12 +197,6 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
 
     # TODO: Do we need to remove the padding here?
     bs_seq_len, hidden_size = input_tensor.shape
-    print(
-        f"Rank {torch.distributed.get_rank()} DEBUG: cp_all_gather_rerange_output",
-        bs_seq_len,
-        hidden_size,
-        flush=True,
-    )
     output_tensor = cp_all_gather_reorganazied_into_tensor(
         input_tensor,
         forward_batch.attn_cp_metadata.total_seq_lens,
@@ -332,11 +326,6 @@ def prepare_context_parallel_metadata(
     remainder = kv_len % (cp_segment_num)
     if remainder > 0:
         split_list[:remainder] = [x + 1 for x in split_list[:remainder]]
-
-    print(
-        f"Rank {torch.distributed.get_rank()} DEBUG: split_list: {split_list}",
-        flush=True,
-    )
 
     seq_max_rank_len = (kv_len + cp_size - 1) // cp_size
     max_rank_len = seq_max_rank_len.repeat_interleave(cp_size).int().tolist()

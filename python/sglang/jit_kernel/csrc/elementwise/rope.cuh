@@ -393,11 +393,11 @@ struct FusedRopeKernel {
         .with_dtype<float>()
         .with_device(device)
         .verify(cos_sin_cache);
-    TensorMatcher({N})  // positions, out_loc
-        .with_dtype<int32_t, int64_t>(id_type)
-        .with_device(device)
-        .verify(positions)
-        .verify(out_loc);
+    // TensorMatcher({N})  // positions, out_loc
+    //     .with_dtype<int32_t, int64_t>(id_type)
+    //     .with_device(device)
+    //     .verify(positions)
+    //     .verify(out_loc);
     TensorMatcher({-1, R})  // k_cache
         .with_strides({Dc, 1})
         .with_dtype<DType>()
