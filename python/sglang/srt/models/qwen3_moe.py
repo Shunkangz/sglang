@@ -28,7 +28,7 @@ from transformers import PretrainedConfig
 from sglang.srt.distributed import (
     get_attn_context_model_parallel_rank,
     get_attn_context_model_parallel_world_size,
-    get_moe_context_model_parallel_world_size,
+    get_moe_data_parallel_world_size,
     get_moe_expert_parallel_world_size,
     get_moe_tensor_parallel_world_size,
     get_pp_group,
@@ -933,10 +933,10 @@ class Qwen3MoeForCausalLM(nn.Module):
 
         self.attn_cp_size = get_attn_context_model_parallel_world_size()
         self.attn_cp_rank = get_attn_context_model_parallel_rank()
-        self.moe_cp_size = get_moe_context_model_parallel_world_size()
+        self.moe_dp_size = get_moe_data_parallel_world_size()
 
         assert (
-            self.attn_cp_size == self.moe_cp_size
+            self.attn_cp_size == self.moe_dp_size
         ), "Attention context parallel size must be equal to MoE context parallel size"
 
     def get_input_embeddings(self) -> nn.Embedding:
