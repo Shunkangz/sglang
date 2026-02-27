@@ -9,7 +9,7 @@ from sglang.test.test_utils import ModelLaunchSettings
 # Runs on 8-GPU systems via nightly suite
 register_cuda_ci(est_time=1200, suite="nightly-8-gpu-common", nightly=True)
 
-QWEN3_30B_MODEL_PATH = f"/home/scratch.trt_llm_data/llm-models/Qwen3/Qwen3-30B-A3B-FP8/"
+QWEN3_30B_MODEL_PATH = "Qwen/Qwen3-30B-A3B-FP8"
 
 BASE_ARGS = [
     "--trust-remote-code",
@@ -19,7 +19,7 @@ BASE_ARGS = [
 
 DP_ARGS = [
     "--tp=4",
-    "--moe-cp-size=2",
+    "--moe-dp-size=2",
     "--ep-size=2",
     "--attn-cp-size=2",
     "--enable-prefill-context-parallel",
@@ -42,18 +42,7 @@ class TestQwen330B(unittest.TestCase):
 
     def test_qwen3_30b(self):
         """Run performance and accuracy for Qwen3-30B-A3B."""
-        base_args = [
-            "--tp=8",
-            "--trust-remote-code",
-        ]
-
         variants = [
-            # ModelLaunchSettings(
-            #     QWEN3_30B_MODEL_PATH,
-            #     tp_size=8,
-            #     extra_args=base_args,
-            #     variant="TP8",
-            # ),
             ModelLaunchSettings(
                 QWEN3_30B_MODEL_PATH,
                 tp_size=4,
