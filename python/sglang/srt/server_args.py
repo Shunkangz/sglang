@@ -2155,6 +2155,10 @@ class ServerArgs:
             ), "tp_size must be divisible by dp_size * attn_cp_size"
             assert self.pp_size == 1, "PP is not supported with context parallelism"
 
+            assert (
+                not self.enable_aiter_allreduce_fusion
+            ), "Aiter allreduce fusion is not supported with context parallelism"
+
         if self.moe_dp_size > 1:
             # The tp_size is the world size, not the real tensor parallel size
             assert (
@@ -2169,6 +2173,10 @@ class ServerArgs:
                 assert (
                     self.ep_size * self.moe_dp_size == self.tp_size
                 ), "ep_size * moe_dp_size must be equal to tp_size"
+
+            assert (
+                not self.enable_aiter_allreduce_fusion
+            ), "Aiter allreduce fusion is not supported with context parallelism"
 
     def _handle_data_parallelism(self):
         if self.dp_size == 1:
