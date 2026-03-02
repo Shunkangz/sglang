@@ -99,6 +99,9 @@ def apply_flashinfer_allreduce_fusion(batch_size: int):
         and batch_size <= FUSE_ALLREDUCE_MAX_BATCH_SIZE
         and not is_dp_attention_enabled()
         and get_global_server_args().enable_flashinfer_allreduce_fusion
+        # FlashInfer's TRT-LLM allreduce backend creates its own NCCL communicator
+        # which doesn't support PyTorch sub-process groups used by context parallelism
+        and get_global_server_args().attn_cp_size <= 1
     )
 
 
