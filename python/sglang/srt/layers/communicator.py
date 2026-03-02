@@ -459,7 +459,7 @@ class LayerCommunicator:
                 ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
                     hidden_states, residual = (
                         self.input_layernorm.forward_with_allreduce_fusion(
-                            hidden_states, residual, use_attn_tp_group=False
+                            hidden_states, residual, use_attn_tp_group=True
                         )
                     )
                 else:
@@ -882,7 +882,9 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 handled = True
 
             if not handled:
-                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                hidden_states = attention_tensor_model_parallel_all_reduce(
+                    hidden_states
+                )
                 if _is_npu and context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
                 hidden_states, residual = layernorm(hidden_states, residual)
