@@ -1987,6 +1987,7 @@ class ServerArgs:
             ]
             and (is_sm90_supported() or is_sm100_supported())
             and not self.enable_dp_attention
+            and self.attn_cp_size <= 1
             and self.nnodes == 1
             and not is_h20_device
             and self.moe_a2a_backend == "none"
