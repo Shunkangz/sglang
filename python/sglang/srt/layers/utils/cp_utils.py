@@ -1,16 +1,12 @@
-# temp NSA debugging environ
 from dataclasses import dataclass
 from itertools import accumulate
-from typing import TYPE_CHECKING, List
+from typing import List
 
 import torch
 import torch.nn.functional as F
 
 from sglang.srt.layers.dp_attention import get_attention_cp_group
 from sglang.srt.server_args import get_global_server_args
-
-if TYPE_CHECKING:
-    pass
 
 
 @dataclass
@@ -84,7 +80,7 @@ def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
     return positions
 
 
-def cp_all_gather_reorganazied_into_tensor(
+def cp_all_gather_reorganized_into_tensor(
     input_tensor, total_len, cp_size, forward_batch, stream
 ):
     """
@@ -128,7 +124,7 @@ def cp_all_gather_reorganazied_into_tensor(
     return outputs
 
 
-def cp_all_gather_reorganazied_into_tensor_kv_cache(
+def cp_all_gather_reorganized_into_tensor_kv_cache(
     input_tensor, total_len, cp_size, forward_batch, stream
 ):
     """
@@ -151,10 +147,6 @@ def cp_all_gather_reorganazied_into_tensor_kv_cache(
         device=input_tensor.device,
         dtype=input_tensor.dtype,
     )
-    # print(
-    #     f"DEBUG: Rank {torch.distributed.get_rank()} cp_all_gather_reorganazied_into_tensor_kv_cache input: {input_tensor.shape}, output: {input_tensor_full.shape}, pad: {pad_size}",
-    #     flush=True,
-    # )
 
     get_attention_cp_group().cp_all_gather_into_tensor_async(
         input_tensor_full, input_tensor, stream
@@ -197,7 +189,7 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
 
     # TODO: Do we need to remove the padding here?
     bs_seq_len, hidden_size = input_tensor.shape
-    output_tensor = cp_all_gather_reorganazied_into_tensor(
+    output_tensor = cp_all_gather_reorganized_into_tensor(
         input_tensor,
         forward_batch.attn_cp_metadata.total_seq_lens,
         cp_size,
@@ -235,7 +227,7 @@ def cp_all_gather_rerange_kv_cache(input_tensor, cp_size, forward_batch, stream)
     | block0 | block1 | block2 | block3 | block4 | block5 | block6 | block7 |
     |   +-------------------------+
     """
-    output_tensor = cp_all_gather_reorganazied_into_tensor_kv_cache(
+    output_tensor = cp_all_gather_reorganized_into_tensor_kv_cache(
         input_tensor,
         forward_batch.attn_cp_metadata.total_seq_lens,
         cp_size,
@@ -296,7 +288,7 @@ def prepare_context_parallel_metadata(
     - Simply slicing by rank order can lead to computational load imbalance:
         * First rank may focus on fewer historical key-value tokens (less computation)
         * Last rank may focus on more tokens (more computation)
-    - To mitigate uneven load, the input hissenstate needs to be sliced by cp_size*2 and rearranged.
+    - To mitigate uneven load, the input hidden states needs to be sliced by cp_size*2 and rearranged.
     """
     # just support batch = 1
     # kv_len: the number of tokens *computed in this extend pass* (i.e. the
