@@ -47,7 +47,6 @@ class FlashInferWorkspaceManager:
         self.max_token_num = None
         self.hidden_dim = None
         self.dtype = None
-        self.group = None
         self.initialized = False
 
     def initialize(

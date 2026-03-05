@@ -25,6 +25,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
+    moe_tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -302,15 +303,15 @@ class LayerScatterModes:
     @classmethod
     def _compute_mlp_mode(cls, context: _LayerModeComputationContext):
         if context.is_layer_sparse:
-            # When using specialized MoE backends (a2a or FP4), they handle token dispatch/combine
-            if (
-                not get_moe_a2a_backend().is_none()
-                or should_use_flashinfer_cutlass_moe_fp4_allgather()
-            ):
-                return ScatterMode.SCATTERED
-
-            # Without CP, use FULL mode (gather across all DP groups)
-            return ScatterMode.FULL
+            return (
+                ScatterMode.SCATTERED
+                if (
+                    # Token dispatch/combine will be handled outside of LayerCommunicator for these modes.
+                    not get_moe_a2a_backend().is_none()
+                    or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                )
+                else ScatterMode.FULL
+            )
         else:
             return (
                 ScatterMode.SCATTERED
@@ -459,7 +460,7 @@ class LayerCommunicator:
                         )
                     )
                 else:
-                    # hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                    hidden_states = moe_tensor_model_parallel_all_reduce(hidden_states)
                     hidden_states, residual = self.input_layernorm(
                         hidden_states, residual
                     )
