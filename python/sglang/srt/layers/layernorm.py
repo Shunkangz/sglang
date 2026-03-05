@@ -315,12 +315,11 @@ class RMSNorm(MultiPlatformOp):
         """
         if residual is not None:
             from sglang.srt.distributed import (
-                get_tensor_model_parallel_world_size,
-                tensor_model_parallel_all_reduce,
-                tensor_model_parallel_fused_allreduce_rmsnorm,
                 get_attn_tensor_model_parallel_world_size,
                 get_moe_expert_parallel_world_size,
                 get_moe_tensor_parallel_world_size,
+                tensor_model_parallel_all_reduce,
+                tensor_model_parallel_fused_allreduce_rmsnorm,
             )
             from sglang.srt.layers.flashinfer_comm_fusion import (
                 flashinfer_allreduce_residual_rmsnorm,
