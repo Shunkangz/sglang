@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from itertools import accumulate
-from typing import List
+from typing import Callable, List
 
 import torch
 import torch.nn.functional as F
@@ -245,6 +245,74 @@ def cp_all_gather_rerange_kv_cache(input_tensor, cp_size, forward_batch, stream)
     )
     # No need to reshape - output_tensor already has the correct shape [seq_len, ...]
     return output_tensor
+
+
+def cp_allgather_and_save_kv_cache(forward_batch, layer, k, v, cp_size):
+    """
+    Allgather KV cache from all CP ranks and write the full result
+    into each rank's local memory pool.
+    """
+    cache_loc = (
+        forward_batch.out_cache_loc
+        if not layer.is_cross_attention
+        else forward_batch.encoder_out_cache_loc
+    )
+
+    k = k.contiguous()
+    v = v.contiguous()
+
+    key_cache_full = cp_all_gather_rerange_kv_cache(
+        k, cp_size, forward_batch, torch.cuda.current_stream()
+    )
+    value_cache_full = cp_all_gather_rerange_kv_cache(
+        v, cp_size, forward_batch, torch.cuda.current_stream()
+    )
+
+    forward_batch.token_to_kv_pool.set_kv_buffer(
+        layer,
+        cache_loc,
+        key_cache_full,
+        value_cache_full,
+        layer.k_scale,
+        layer.v_scale,
+    )
+
+
+def cp_attn_forward_extend(
+    forward_batch,
+    q: torch.Tensor,
+    device: torch.device,
+    attn_fn: Callable[[torch.Tensor, torch.Tensor, torch.Tensor, int], torch.Tensor],
+) -> torch.Tensor:
+    """
+    Split q into prev/next zigzag halves based on CP metadata, call the
+    backend-specific attention function twice with appropriate per-half
+    metadata, and concatenate the results.
+
+    attn_fn signature:
+        attn_fn(q, cu_seqlens_q, cache_seqlens, max_seqlen_q) -> result
+    where only these four CP-varying parameters differ between halves.
+    All other backend-specific args should be captured in the closure.
+    """
+    cp_meta = forward_batch.attn_cp_metadata
+
+    q_prev, q_next = torch.chunk(q, 2, dim=0)
+
+    cu_seqlens_q_prev = torch.tensor(
+        [0, cp_meta.actual_seq_q_prev], device=device, dtype=torch.int32
+    )
+    result_prev = attn_fn(
+        q_prev, cu_seqlens_q_prev, cp_meta.kv_len_prev_tensor, cp_meta.actual_seq_q_prev
+    )
+
+    cu_seqlens_q_next = torch.tensor(
+        [0, cp_meta.actual_seq_q_next], device=device, dtype=torch.int32
+    )
+    result_next = attn_fn(
+        q_next, cu_seqlens_q_next, cp_meta.kv_len_next_tensor, cp_meta.actual_seq_q_next
+    )
+
+    return torch.concat([result_prev, result_next], dim=0)
 
 
 def prepare_context_parallel_metadata(
