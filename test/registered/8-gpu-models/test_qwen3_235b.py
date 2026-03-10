@@ -81,9 +81,9 @@ class TestQwen3235BFP8(unittest.TestCase):
 
         DP_ARGS = [
             "--tp=8",
-            "--moe-cp-size=2",
+            "--moe-dp-size=2",
             "--attn-cp-size=2",
-            "--ep-size=2",
+            "--ep-size=4",
             "--enable-prefill-context-parallel",
         ]
 
