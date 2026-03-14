@@ -114,7 +114,7 @@ def _forward_with_allreduce_fusion(
                 world_size = get_moe_expert_parallel_world_size()
             else:
                 world_size = get_moe_tensor_parallel_world_size()
-                
+
         if world_size() > 1:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
@@ -132,7 +132,7 @@ def _forward_with_allreduce_fusion(
                     residual=residual,
                     weight=weight,
                     eps=norm_module.variance_epsilon,
-                    use_attn_tp_group=use_attn_tp_group
+                    use_attn_tp_group=use_attn_tp_group,
                 )
                 if fused_result[0] is not None:
                     return fused_result

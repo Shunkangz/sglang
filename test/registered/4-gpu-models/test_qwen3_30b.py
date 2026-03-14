@@ -42,6 +42,7 @@ class TestQwen330B(CustomTestCase):
                 "--max-running-requests",
                 "32",
                 "--trust-remote-code",
+                "--disable-piecewise-cuda-graph",
                 "--model-loader-extra-config",
                 '{"enable_multithread_load": true, "num_threads": 64}',
             ],
