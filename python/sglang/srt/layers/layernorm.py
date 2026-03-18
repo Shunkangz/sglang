@@ -115,7 +115,7 @@ def _forward_with_allreduce_fusion(
             else:
                 world_size = get_moe_tensor_parallel_world_size()
 
-        if world_size() > 1:
+        if world_size > 1:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
 
