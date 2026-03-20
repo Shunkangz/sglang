@@ -547,11 +547,17 @@ class GemmaRMSNorm(MultiPlatformOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
+        use_attn_tp_group: bool = True,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Forward with allreduce fusion; uses 1 + weight for fused kernels."""
         # TODO(brayden): we can see if TRTLLM allreduce fusion can provide gemma-style norm
         return _forward_with_allreduce_fusion(
-            self, x, residual, post_residual_addition, self.weight + 1.0
+            self,
+            x,
+            residual,
+            post_residual_addition,
+            self.weight + 1.0,
+            use_attn_tp_group=True,
         )
 
 
