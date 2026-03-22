@@ -33,7 +33,7 @@ from sglang.srt.distributed import (
     get_moe_tensor_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_rank,
-    moe_expert_parallel_all_reduce,
+    moe_tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -49,6 +49,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
+    should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -320,8 +321,15 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         topk_output = self.topk(hidden_states, router_logits)
         final_hidden_states = self.experts(hidden_states, topk_output)
 
-        if self.ep_size > 1 and not should_allreduce_fusion:
-            final_hidden_states = moe_expert_parallel_all_reduce(final_hidden_states)
+        if (
+            self.tp_size > 1
+            and not should_allreduce_fusion
+            and not use_reduce_scatter
+            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+        ):
+            final_hidden_states = moe_tensor_model_parallel_all_reduce(
+                final_hidden_states
+            )
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
