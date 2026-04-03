@@ -2739,6 +2739,15 @@ class ServerArgs:
                 not self.enable_aiter_allreduce_fusion
             ), "Aiter allreduce fusion is not supported with context parallelism"
 
+        if self.attn_cp_size > 1:
+            assert self.attn_cp_size % self.moe_dp_size == 0, (
+                f"attn_cp_size ({self.attn_cp_size}) must be divisible by "
+                f"moe_dp_size ({self.moe_dp_size}). "
+                "Valid values: moe_dp_size=1 (allgather all CP tokens for MoE) "
+                "or moe_dp_size=attn_cp_size (independent MoE per CP rank, existing behavior), "
+                "or any divisor in between."
+            )
+
     def _handle_data_parallelism(self):
         if self.dp_size == 1:
             self.enable_dp_attention = False
