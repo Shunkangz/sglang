@@ -43,11 +43,7 @@ def is_prefill_cp_in_seq_split():
 
 
 def can_cp_split(seq_len: int, cp_size: int, forward_batch):
-    # CP metadata (zigzag split) only supports batch=1. With multiple requests
-    # in the batch, the metadata would treat all tokens as one sequence, producing
-    # garbled flash attention inputs that hang the kernel.
-    # When batch>1, we skip CP and fall back to standard attention (correct because
-    # each rank holds the full KV cache via allgather after prior CP prefills).
+    # CP metadata (zigzag split) only supports batch=1 for now.
     cur_cp_seq_len = seq_len // (cp_size * 2)
     if (
         cur_cp_seq_len != 0

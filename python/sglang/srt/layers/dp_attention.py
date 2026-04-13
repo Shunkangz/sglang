@@ -596,7 +596,7 @@ def get_moe_cp_size() -> int:
     return _get_moe_dp_group().world_size
 
 
-def enable_moe_cp_allgather() -> bool:
+def is_enable_moe_cp_allgather() -> bool:
     """True when moe_dp_size < attn_cp_size, requiring allgather across CP ranks before MoE."""
     from sglang.srt.server_args import get_global_server_args
 
@@ -606,10 +606,6 @@ def enable_moe_cp_allgather() -> bool:
 
 def moe_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
     return _get_moe_dp_group().all_gather_into_tensor(output, input)
-
-
-def moe_cp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
-    return _get_moe_dp_group().reduce_scatter_tensor(output, input)
 
 
 def attn_tp_all_gather(output_list: List[torch.Tensor], input: torch.Tensor):

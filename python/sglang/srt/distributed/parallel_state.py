@@ -1870,15 +1870,12 @@ def initialize_model_parallel(
                 )
                 ranks = list(range(st, en))
                 group_ranks.append(ranks)
-        # When context parallelism is active, the ATTN_TP group is a sub-group of the
-        # full TP group. Piecewise CUDA graph warmup runs with is_in_piecewise_cuda_graph()
-        # True and requires outplace all-reduce (pynccl). Enable pynccl for ATTN_TP whenever
-        # attn_cp_size > 1 so the warmup forward pass doesn't crash.
+
         _ATTN_TP = init_model_parallel_group(
             group_ranks,
             get_world_group().local_rank,
             backend,
-            use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP or enable_symm_mem or (attn_cp_size > 1),
+            use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP or enable_symm_mem,
             use_mscclpp_allreduce=False,
             use_custom_allreduce=False,
             use_torch_symm_mem_allreduce=False,

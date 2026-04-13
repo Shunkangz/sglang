@@ -42,7 +42,6 @@ from sglang.srt.layers.dp_attention import (
     dp_gather_partial,
     dp_reduce_scatter_tensor,
     dp_scatter,
-    enable_moe_cp_allgather,
     get_attention_cp_rank,
     get_attention_cp_size,
     get_attention_dp_size,
@@ -54,6 +53,7 @@ from sglang.srt.layers.dp_attention import (
     get_moe_cp_size,
     is_allocation_symmetric,
     is_dp_attention_enabled,
+    is_enable_moe_cp_allgather,
     moe_cp_all_gather_into_tensor,
 )
 from sglang.srt.layers.flashinfer_comm_fusion import is_flashinfer_allreduce_unavailable
@@ -376,7 +376,7 @@ class LayerScatterModes:
             ):
                 return ScatterMode.SCATTERED
             # NSA CP doesn't support MOE_FULL yet; fall back to FULL
-            if enable_moe_cp_allgather() and not is_nsa_enable_prefill_cp():
+            if is_enable_moe_cp_allgather() and not is_nsa_enable_prefill_cp():
                 return ScatterMode.MOE_FULL
             return ScatterMode.FULL
         else:
@@ -717,7 +717,7 @@ class LayerCommunicator:
         # the fusion path skips postprocess_layer which contains the moe_cp scatter.
         # Without scatter, hidden_states remain at MOE_FULL size while residual is at
         # TP_ATTN_FULL size, causing a shape mismatch.
-        if enable_moe_cp_allgather():
+        if is_enable_moe_cp_allgather():
             return False
 
         if (
