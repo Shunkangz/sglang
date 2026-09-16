@@ -11,11 +11,18 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     estimate_prefill_extend_tile_metrics,
 )
+from sglang.srt.mem_cache.allocation import (
+    _kv_shard_rotation_bases,
+    alloc_paged_token_slots_extend,
+)
+from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     DecLockRefResult,
+    EvictResult,
     IncLockRefResult,
 )
+from sglang.srt.mem_cache.page_interleave import PageShardSpec
 from sglang.srt.mem_cache.prefill_budget import (
     PrefillBudget,
     SWAPrefillBudget,
@@ -247,6 +254,367 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(req.extend_range.length, 8)
         self.assertEqual(adder.memory_budget.total_offset, 12)
         self.assertEqual(adder.memory_budget.swa_offset, 12)
+
+    def _create_kv_shard_adder(self, free_pages, *, chunk_pages=32, **kwargs):
+        """Keep real cached pages and free lists; mock only the radix metadata."""
+        page_size, shard_size = 16, 4
+        allocator = PageInterleavePoolAllocator(
+            size=(max(free_pages) + 1) * page_size,
+            physical_page_size=page_size,
+            shard_size=shard_size,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+            shard_spec=PageShardSpec(
+                shard_rank=0,
+                shard_size=shard_size,
+                page_size=page_size,
+                max_prefix_tokens=64 * page_size,
+                chunk_tokens=chunk_pages * page_size,
+            ),
+        )
+        prefixes = []
+        for owner in range(shard_size):
+            prefixes.append(
+                allocator.alloc_extend(
+                    prefix_lens=torch.tensor([0]),
+                    prefix_lens_cpu=torch.tensor([0]),
+                    seq_lens=torch.tensor([page_size]),
+                    seq_lens_cpu=torch.tensor([page_size]),
+                    last_loc=torch.tensor([-1]),
+                    extend_num_tokens=page_size,
+                    rotation_bases=[owner],
+                )
+            )
+        # Allocate additional protected pages to produce the requested skew.
+        for owner, target_count in enumerate(free_pages):
+            for _ in range(allocator.class_free_page_counts()[owner] - target_count):
+                allocator.alloc_extend(
+                    prefix_lens=torch.tensor([0]),
+                    prefix_lens_cpu=torch.tensor([0]),
+                    seq_lens=torch.tensor([page_size]),
+                    seq_lens_cpu=torch.tensor([page_size]),
+                    last_loc=torch.tensor([-1]),
+                    extend_num_tokens=page_size,
+                    rotation_bases=[owner],
+                )
+        self.assertEqual(allocator.class_free_page_counts(), free_pages)
+        tree_cache = self.create_tree_cache()
+        tree_cache.token_to_kv_pool_allocator = allocator
+        tree_cache.supports_mamba.return_value = False
+        tree_cache.is_tree_cache.return_value = False
+        tree_cache.rotation_base_of.side_effect = lambda node: node.rotation_base
+        tree_cache.kv_shard_evictable_page_counts.return_value = [0] * shard_size
+        adder = self.create_adder(
+            self.create_running_batch(),
+            page_size=page_size,
+            token_to_kv_pool_allocator=allocator,
+            tree_cache=tree_cache,
+            **kwargs,
+        )
+        return adder, allocator, prefixes
+
+    def _create_kv_shard_req(self, rid, prefixes, target_class=None):
+        req = self.create_mock_req(rid, priority=0, max_new_tokens=1)
+        req.sampling_params.ignore_eos = False
+        if target_class is None:
+            req.prefix_indices = torch.empty(0, dtype=torch.int64)
+            rotation_base = None
+        else:
+            rotation_base = (target_class - 1) % 4
+            req.prefix_indices = prefixes[rotation_base]
+        req.last_node = SimpleNamespace(rotation_base=rotation_base)
+        req.kv_rotation_base = rotation_base
+        req.kv_shard_admission_base = None
+        # The extension occupies one page. A possible output token fits its
+        # remaining slot, so this case does not depend on future decode policy.
+        req.full_untruncated_fill_ids = list(range(len(req.prefix_indices) + 15))
+
+        def set_extend_range(start, end):
+            req.extend_range = Range(start, end)
+            req.extend_input_len = end - start
+
+        req.set_extend_range.side_effect = set_extend_range
+        return req
+
+    def _allocate_kv_shard_admissions(self, adder, allocator, *, use_wrapper=False):
+        reqs = adder.can_run_list
+        prefix_lens = torch.tensor([len(req.prefix_indices) for req in reqs])
+        seq_lens = torch.tensor([req.extend_range.end for req in reqs])
+        bases = _kv_shard_rotation_bases(
+            adder.tree_cache, SimpleNamespace(reqs=reqs), prefix_lens
+        )
+        kwargs = dict(
+            prefix_lens=prefix_lens,
+            prefix_lens_cpu=prefix_lens,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens,
+            last_loc=torch.tensor(
+                [
+                    int(req.prefix_indices[-1]) if len(req.prefix_indices) else -1
+                    for req in reqs
+                ]
+            ),
+            extend_num_tokens=sum(req.extend_range.length for req in reqs),
+        )
+        if use_wrapper:
+            out = alloc_paged_token_slots_extend(
+                adder.tree_cache, batch=SimpleNamespace(reqs=reqs), **kwargs
+            )
+            bases = [req.kv_rotation_base for req in reqs]
+        else:
+            out = allocator.alloc_extend(rotation_bases=bases, **kwargs)
+        self.assertIsNotNone(out)
+        return out, bases
+
+    def test_kv_shard_cached_prefix_uses_free_target_class(self):
+        adder, allocator, prefixes = self._create_kv_shard_adder([0, 2, 2, 2])
+        req = self._create_kv_shard_req("class-1", prefixes, target_class=1)
+
+        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+
+        self.assertEqual(adder.can_run_list, [req])
+        # Admission reserves capacity without physically allocating pages.
+        self.assertEqual(allocator.class_free_page_counts(), [0, 2, 2, 2])
+        out, _ = self._allocate_kv_shard_admissions(adder, allocator)
+        self.assertEqual(int(out[0]) // 16 % 4, 1)
+        self.assertEqual(allocator.class_free_page_counts(), [0, 1, 2, 2])
+
+    def test_kv_shard_same_phase_reservations_do_not_over_admit(self):
+        adder, allocator, prefixes = self._create_kv_shard_adder([0, 2, 2, 2])
+        same_phase = [
+            self._create_kv_shard_req(f"class-1-{i}", prefixes, target_class=1)
+            for i in range(3)
+        ]
+        results = [
+            adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+            for req in same_phase
+        ]
+        self.assertEqual(results[-1], AddReqResult.SKIP)
+        self.assertEqual(adder.can_run_list, same_phase[:2])
+
+        # A failed candidate must not consume another class's usable capacity.
+        other = self._create_kv_shard_req("class-2", prefixes, target_class=2)
+        adder.add_one_req(other, has_chunked_req=False, truncation_align_size=None)
+        self.assertEqual(adder.can_run_list, [*same_phase[:2], other])
+        self.assertEqual(allocator.class_free_page_counts(), [0, 2, 2, 2])
+        self._allocate_kv_shard_admissions(adder, allocator)
+        self.assertEqual(allocator.class_free_page_counts(), [0, 0, 1, 2])
+
+    def test_kv_shard_new_chains_use_reservation_adjusted_rotation(self):
+        adder, allocator, prefixes = self._create_kv_shard_adder([0, 2, 2, 2])
+        reqs = [self._create_kv_shard_req(f"new-{i}", prefixes) for i in range(6)]
+        for req in reqs:
+            adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+        self.assertEqual(adder.can_run_list, reqs)
+        self.assertEqual(allocator.class_free_page_counts(), [0, 2, 2, 2])
+
+        _, bases = self._allocate_kv_shard_admissions(adder, allocator)
+        self.assertEqual(bases, [1, 2, 3, 1, 2, 3])
+        self.assertEqual(allocator.class_free_page_counts(), [0, 0, 0, 0])
+
+    def test_kv_shard_rejected_candidate_does_not_leak_page_reservation(self):
+        for gate in ("scratch", "tile", "delayer"):
+            with self.subTest(gate=gate):
+                delayer = _RecordingDelayer(allow=True)
+                adder, allocator, prefixes = self._create_kv_shard_adder(
+                    [0, 1, 2, 2],
+                    chunk_pages=1 if gate == "scratch" else 32,
+                    prefill_delayer_single_pass=delayer,
+                )
+                first = self._create_kv_shard_req("first", prefixes, target_class=2)
+                adder.add_one_req(
+                    first, has_chunked_req=False, truncation_align_size=None
+                )
+                self.assertEqual(adder.can_run_list, [first])
+                req = self._create_kv_shard_req(
+                    "last-class-1-page", prefixes, target_class=1
+                )
+                delayer.allow = gate != "delayer"
+                with (
+                    patch.object(schedule_policy, "_IS_HIP", gate == "tile"),
+                    patch.object(schedule_policy, "PREFILL_TILE_BUDGET", 1),
+                    patch.object(
+                        schedule_policy, "PREFILL_TILE_BUDGET_MODE", "compact"
+                    ),
+                ):
+                    result = adder.add_one_req(
+                        req, has_chunked_req=False, truncation_align_size=None
+                    )
+                self.assertEqual(result, AddReqResult.OTHER)
+                self.assertEqual(adder.can_run_list, [first])
+
+                delayer.allow = True
+                adder.kv_shard_scratch_spec = PageShardSpec(
+                    shard_rank=0,
+                    shard_size=4,
+                    page_size=16,
+                    max_prefix_tokens=64 * 16,
+                    chunk_tokens=32 * 16,
+                )
+                adder.add_one_req(
+                    req, has_chunked_req=False, truncation_align_size=None
+                )
+                self.assertEqual(adder.can_run_list, [first, req])
+                self._allocate_kv_shard_admissions(adder, allocator)
+                self.assertEqual(allocator.class_free_page_counts(), [0, 0, 1, 2])
+
+    def test_kv_shard_wrong_class_evictable_pages_do_not_admit(self):
+        adder, allocator, prefixes = self._create_kv_shard_adder([0, 1, 1, 1])
+        adder.tree_cache.evictable_size.return_value = 16
+        adder.tree_cache.kv_shard_evictable_page_counts.return_value = [0, 1, 0, 0]
+        req = self._create_kv_shard_req("empty-class-0", prefixes, target_class=0)
+
+        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+
+        self.assertEqual(adder.can_run_list, [])
+        self.assertEqual(allocator.class_free_page_counts(), [0, 1, 1, 1])
+
+    def test_kv_shard_prefix_lock_removes_candidate_recoverable_pages(self):
+        delayer = _RecordingDelayer(allow=True)
+        adder, allocator, prefixes = self._create_kv_shard_adder(
+            [0, 1, 1, 1], prefill_delayer_single_pass=delayer
+        )
+        req = self._create_kv_shard_req("locks-class-0", prefixes, target_class=0)
+        req.prefix_indices = torch.cat(prefixes)
+        req.last_node.rotation_base = 0
+        req.kv_rotation_base = 0
+        req.full_untruncated_fill_ids = list(range(64 + 15))
+        adder.tree_cache.evictable_size.return_value = 16
+        adder.tree_cache.kv_shard_evictable_page_counts.return_value = [1, 0, 0, 0]
+
+        def pin_prefix(node):
+            adder.tree_cache.evictable_size.return_value = 0
+            adder.tree_cache.kv_shard_evictable_page_counts.return_value = [0] * 4
+            return IncLockRefResult()
+
+        adder.tree_cache.inc_lock_ref.side_effect = pin_prefix
+        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+
+        self.assertEqual(adder.can_run_list, [])
+        self.assertEqual(delayer.calls, [])
+        self.assertEqual(allocator.class_free_page_counts(), [0, 1, 1, 1])
+
+    def test_kv_shard_chunk_reserves_only_current_extend(self):
+        adder, allocator, prefixes = self._create_kv_shard_adder(
+            [0, 2, 2, 2], rem_chunk_tokens=16
+        )
+        req = self._create_kv_shard_req("chunked", prefixes, target_class=1)
+        # The complete tail reaches empty class 0, but this chunk only needs
+        # class 1. Future chunks are scheduled against their own capacities.
+        req.full_untruncated_fill_ids = list(range(16 + 5 * 16))
+
+        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+
+        self.assertEqual(adder.can_run_list, [req])
+        self.assertIs(adder.new_chunked_req, req)
+        self.assertEqual(req.extend_range, Range(16, 32))
+        self._allocate_kv_shard_admissions(adder, allocator)
+        self.assertEqual(allocator.class_free_page_counts(), [0, 1, 2, 2])
+
+    def test_kv_shard_continuing_chunk_uses_exact_class_budget(self):
+        delayer = _RecordingDelayer(allow=False)
+        adder, allocator, prefixes = self._create_kv_shard_adder(
+            [0, 2, 2, 2],
+            rem_chunk_tokens=16,
+            prefill_delayer_single_pass=delayer,
+        )
+        req = self._create_kv_shard_req("continuing", prefixes, target_class=1)
+
+        unfinished = adder.add_chunked_req(req)
+
+        self.assertIsNone(unfinished)
+        self.assertEqual(adder.can_run_list, [req])
+        self.assertEqual(delayer.calls, [True])
+        self._allocate_kv_shard_admissions(adder, allocator)
+        self.assertEqual(allocator.class_free_page_counts(), [0, 1, 2, 2])
+
+    def test_kv_shard_allocation_preserves_root_rotation_after_eviction(self):
+        adder, allocator, prefixes = self._create_kv_shard_adder([0, 2, 1, 1])
+        root = self._create_kv_shard_req("new-root", prefixes)
+        adder.add_one_req(root, has_chunked_req=False, truncation_align_size=None)
+        self.assertEqual(root.kv_shard_admission_base, 1)
+
+        adder.tree_cache.evictable_size.return_value = 3 * 16
+        adder.tree_cache.kv_shard_evictable_page_counts.return_value = [3, 0, 0, 0]
+        later = self._create_kv_shard_req("needs-eviction", prefixes, target_class=0)
+        adder.add_one_req(later, has_chunked_req=False, truncation_align_size=None)
+        self.assertEqual(adder.can_run_list, [root, later])
+
+        def evict_class_zero(params):
+            # These are the three protected class-0 pages allocated by the
+            # fixture. Eviction makes class 0 the next least-full root seed.
+            allocator.free(torch.tensor([4, 8, 12]) * 16)
+            self.assertEqual(allocator.least_full_class(), 0)
+            adder.tree_cache.evictable_size.return_value = 0
+            adder.tree_cache.kv_shard_evictable_page_counts.return_value = [0] * 4
+            return EvictResult(num_tokens_evicted=3 * 16)
+
+        adder.tree_cache.evict.side_effect = evict_class_zero
+        out, bases = self._allocate_kv_shard_admissions(
+            adder, allocator, use_wrapper=True
+        )
+
+        self.assertEqual(bases, [1, 3])
+        self.assertEqual(int(out[0]) // 16 % 4, 1)
+        self.assertEqual(int(out[15]) // 16 % 4, 0)
+        self.assertIsNone(root.kv_shard_admission_base)
+        self.assertIsNone(later.kv_shard_admission_base)
+        self.assertEqual(adder.tree_cache.evict.call_count, 1)
+        self.assertEqual(adder.tree_cache.evict.call_args.args[0].num_tokens, 16)
+        self.assertEqual(allocator.class_free_page_counts(), [2, 1, 1, 1])
+
+    def test_kv_shard_candidate_cannot_pin_an_accepted_reservations_capacity(self):
+        adder, allocator, prefixes = self._create_kv_shard_adder([0, 2, 1, 1])
+        adder.tree_cache.evictable_size.return_value = 16
+        adder.tree_cache.kv_shard_evictable_page_counts.return_value = [1, 0, 0, 0]
+        first = self._create_kv_shard_req(
+            "uses-recoverable-page", prefixes, target_class=0
+        )
+        later = self._create_kv_shard_req(
+            "pins-recoverable-page", prefixes, target_class=1
+        )
+
+        def lock_prefix(node):
+            if node is later.last_node:
+                adder.tree_cache.evictable_size.return_value = 0
+                adder.tree_cache.kv_shard_evictable_page_counts.return_value = [0] * 4
+            return IncLockRefResult()
+
+        def unlock_prefix(node):
+            if node is later.last_node:
+                adder.tree_cache.evictable_size.return_value = 16
+                adder.tree_cache.kv_shard_evictable_page_counts.return_value = [
+                    1,
+                    0,
+                    0,
+                    0,
+                ]
+            return DecLockRefResult()
+
+        adder.tree_cache.inc_lock_ref.side_effect = lock_prefix
+        adder.tree_cache.dec_lock_ref.side_effect = unlock_prefix
+        adder.add_one_req(first, has_chunked_req=False, truncation_align_size=None)
+        result = adder.add_one_req(
+            later, has_chunked_req=False, truncation_align_size=None
+        )
+        self.assertEqual(result, AddReqResult.SKIP)
+        self.assertEqual(adder.can_run_list, [first])
+        self.assertEqual(
+            adder.tree_cache.kv_shard_evictable_page_counts(), [1, 0, 0, 0]
+        )
+
+        def evict_prefix(params):
+            allocator.free(prefixes[0])
+            adder.tree_cache.evictable_size.return_value = 0
+            adder.tree_cache.kv_shard_evictable_page_counts.return_value = [0] * 4
+            return EvictResult(num_tokens_evicted=16)
+
+        adder.tree_cache.evict.side_effect = evict_prefix
+        self._allocate_kv_shard_admissions(adder, allocator, use_wrapper=True)
+        self.assertEqual(allocator.class_free_page_counts(), [0, 2, 1, 1])
+        self.assertIsNone(first.kv_shard_admission_base)
 
     def test_storage_prefetch_fulfillment_resolves_at_admission(self):
         adder = self.create_adder(self.create_running_batch())
@@ -663,38 +1031,22 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder2.rem_chunk_tokens, 0)  # 3 - 3 = 0
         self.assertEqual(result3, AddReqResult.OTHER)
 
-    @patch(
-        "sglang.srt.mem_cache.allocator.page_interleave.page_interleave_shard_size",
-        return_value=4,
-    )
-    def test_ignore_eos_reserves_all_shard_class_pages(self, _shard_size):
-        """Disabled-radix admission must charge one page per shard class."""
-        self.mock_tree_cache.disable = True
-        self.mock_token_allocator.page_size = 16
-        self.mock_token_allocator.shard_spec = SimpleNamespace(
-            max_prefix_tokens=1024, chunk_tokens=1024
-        )
-        self.mock_token_allocator.available_size.return_value = 64
-        adder = self.create_adder(self.create_running_batch(), page_size=16)
-
-        req = self.create_mock_req("ignore_eos", priority=0, max_new_tokens=1)
-        req.sampling_params.ignore_eos = True
-        req.origin_input_ids = list(range(16))
-        req.full_untruncated_fill_ids = list(range(16))
-        req.last_node = MagicMock()
-        req.set_extend_range = MagicMock(
-            side_effect=lambda start, end: setattr(
-                req, "extend_range", Range(start, end)
-            )
-        )
-
-        result = adder.add_one_req(
-            req, has_chunked_req=False, truncation_align_size=None
-        )
-
-        self.assertEqual(result, AddReqResult.NO_TOKEN)
-        self.assertEqual(adder.can_run_list, [])
-        req.set_extend_range.assert_not_called()
+    def test_ignore_eos_uses_exact_shard_class_pages(self):
+        """Disabled-radix prefills use the same physical-page admission budget."""
+        adder, allocator, prefixes = self._create_kv_shard_adder([1, 1, 1, 1])
+        adder.tree_cache.disable = True
+        reqs = [
+            self._create_kv_shard_req(f"ignore-eos-{i}", prefixes) for i in range(4)
+        ]
+        for req in reqs:
+            req.sampling_params.ignore_eos = True
+            req.origin_input_ids = list(range(16))
+            req.full_untruncated_fill_ids = list(range(16))
+            adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+        self.assertEqual(adder.can_run_list, reqs)
+        _, bases = self._allocate_kv_shard_admissions(adder, allocator)
+        self.assertEqual(bases, [0, 1, 2, 3])
+        self.assertEqual(allocator.class_free_page_counts(), [0, 0, 0, 0])
 
     def _build_hybrid_swa_chunked_req(
         self,

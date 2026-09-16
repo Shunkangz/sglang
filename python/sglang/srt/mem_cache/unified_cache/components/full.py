@@ -173,6 +173,8 @@ class FullComponent(TreeComponent):
             device_frees[self.component_type].append(cd.value)
             freed = len(cd.value)
             self.tree_core.component_evictable_size_[self.component_type] -= freed
+            if getattr(self.tree_core, "kv_shard_size", 1) > 1:
+                self.tree_core.adjust_kv_shard_evictable_pages(node, -1)
             # NOTE: cd.value = None is deferred to _cascade_evict (Full as trigger)
             # because SWA's free_swa still needs to read Full.value.
             # cd.value = None
@@ -298,6 +300,8 @@ class FullComponent(TreeComponent):
             if cd.lock_ref == 0:
                 key_len = len(cd.value)
                 self.tree_core.component_evictable_size_[ct] -= key_len
+                if getattr(self.tree_core, "kv_shard_size", 1) > 1:
+                    self.tree_core.adjust_kv_shard_evictable_pages(cur, -1)
                 self.tree_core.component_protected_size_[ct] += key_len
                 delta += key_len
             cd.lock_ref += 1
@@ -333,6 +337,8 @@ class FullComponent(TreeComponent):
             if cd.lock_ref == 1 and cd.value is not None:
                 key_len = len(cd.value)
                 self.tree_core.component_evictable_size_[ct] += key_len
+                if getattr(self.tree_core, "kv_shard_size", 1) > 1:
+                    self.tree_core.adjust_kv_shard_evictable_pages(cur, 1)
                 self.tree_core.component_protected_size_[ct] -= key_len
             cd.lock_ref -= 1
             if cd.lock_ref == 0:
@@ -426,6 +432,8 @@ class FullComponent(TreeComponent):
                     self.tree_core.component_protected_size_[ct] += n_len
                 else:
                     self.tree_core.component_evictable_size_[ct] += n_len
+                    if getattr(self.tree_core, "kv_shard_size", 1) > 1:
+                        self.tree_core.adjust_kv_shard_evictable_pages(n, 1)
                 self.tree_core._update_evictable_leaf_sets(n)
 
             self.tree_core._update_evictable_leaf_sets(node)

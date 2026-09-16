@@ -3456,6 +3456,9 @@ class UnifiedRadixCache(BasePrefixCache):
     def session_held_mamba_slots(self, active_pool_idxs: Optional[set] = None) -> int:
         return self.session.session_held_mamba_slots(active_pool_idxs)
 
+    def kv_shard_evictable_page_counts(self) -> list[int]:
+        return self.tree_core.kv_shard_evictable_page_counts()
+
     def evictable_size(self) -> int:
         return self.tree_core.evictable_size()
 

@@ -193,6 +193,10 @@ class UnifiedTreeCoreInterface(ABC):
     # UnifiedRadixCache.__init__ rejects that pairing at construction.
     supports_rotation_base: bool = False
 
+    def kv_shard_evictable_page_counts(self) -> list[int]:
+        """Per-owner recoverable pages; required only by sharded admission."""
+        raise NotImplementedError("this tree core does not track sharded pages")
+
     def rotation_base_of(self, node_id: NodeId) -> Optional[int]:
         """Logical-page KV sharding: the node's chain rotation base, or None
         when sharding is off (and on the root, which starts no chain).

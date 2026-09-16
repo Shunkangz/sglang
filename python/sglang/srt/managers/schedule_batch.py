@@ -1147,6 +1147,10 @@ class Req(ReqDllmMixin):
         # would make it stale); the only allocation-time reader is the
         # ChunkCache fallback, which has no tree nodes and no rebind.
         self.kv_rotation_base: Optional[int] = None
+        # Rotation selected for the pending sharded prefill allocation. New
+        # chains must retain this choice across eviction between admission and
+        # allocation. Cleared once the allocation commits.
+        self.kv_shard_admission_base: Optional[int] = None
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -1893,6 +1897,7 @@ class Req(ReqDllmMixin):
         self.last_node = None
         self.kv.cache_protected_len = 0
         self.kv_rotation_base = None
+        self.kv_shard_admission_base = None
         self.num_matched_prefix_tokens = 0
         self.lock_receipt = DecLockRefParams()
         self.swa_prefix_lock_released = False

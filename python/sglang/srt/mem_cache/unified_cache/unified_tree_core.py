@@ -28,6 +28,10 @@ import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.allocator.page_interleave import (
+    PageInterleavePoolAllocator,
+    page_interleave_shard_size,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
@@ -149,6 +153,9 @@ class UnifiedTreeNode:
         # inserting request's host base, copied on split, read through
         # req.last_node at alloc time. None when sharding is off.
         self.rotation_base: Optional[int] = None
+        # Absolute position of this segment. Descendants keep their position
+        # when a parent splits, so class accounting needs no ancestor walk.
+        self.kv_shard_start_page = 0
 
     def component(self, component_type: ComponentType) -> ComponentData:
         return self.component_data[component_type]
@@ -413,6 +420,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         components: dict[ComponentType, TreeComponent],
     ):
         self.page_size = params.page_size
+        self.kv_shard_size = page_interleave_shard_size(
+            params.token_to_kv_pool_allocator
+        )
         self.is_eagle = params.is_eagle and ComponentType.MAMBA not in components
         self.enable_hicache = False
         self.is_host_memory_buffer_only = False
@@ -477,6 +487,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             self.root_node.component_data[ct].lock_ref = 1
 
         self.component_evictable_size_ = {ct: 0 for ct in self.component_types}
+        self._kv_shard_evictable_pages = [0] * self.kv_shard_size
         self.component_protected_size_ = {ct: 0 for ct in self.component_types}
 
         self.lru_lists = {
@@ -1360,6 +1371,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # The rotation base is constant along a chain (position-page P keeps
         # owner (b + P) % N on both sides of the split).
         new_node.rotation_base = child.rotation_base
+        if self.kv_shard_size > 1:
+            new_node.kv_shard_start_page = child.kv_shard_start_page
+            child.kv_shard_start_page += split_len // self.page_size
 
         child.parent = new_node
         child.key = child.key[split_len:]
@@ -1418,9 +1432,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # rotation, so stamping the inserting request's base keeps every node
         # on a root path carrying the same base.
         new_node.rotation_base = rotation_base
+        if self.kv_shard_size > 1:
+            new_node.kv_shard_start_page = (
+                parent.kv_shard_start_page + len(parent.key) // self.page_size
+            )
         new_node.component_data[BASE_COMPONENT_TYPE].value = value.clone()
         parent.children[key.child_key(self.page_size)] = new_node
         self.component_evictable_size_[BASE_COMPONENT_TYPE] += len(value)
+        self.adjust_kv_shard_evictable_pages(new_node, 1)
         if self.enable_storage or self.enable_external_cache_linker:
             new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
 
@@ -1446,6 +1465,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             self.component_protected_size_[ct] += n
         else:
             self.component_evictable_size_[ct] += n
+            self.adjust_kv_shard_evictable_pages(node, 1)
         self._update_evictable_leaf_sets(node)
         # A backuped node restored from fresh KV is a duplicate right away.
         self._update_duplicate_tracking(node)
@@ -2845,6 +2865,20 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 self._check_lru_linked_list(lru, ct, "device", errors)
                 self._check_lru_linked_list(host_lru, ct, "host", errors)
 
+        if self.kv_shard_size > 1:
+            class_pages = [0] * self.kv_shard_size
+            for node in all_nodes:
+                cd = node.component_data[BASE_COMPONENT_TYPE]
+                if node is self.root_node or cd.value is None or cd.lock_ref > 0:
+                    continue
+                for owner, count in enumerate(self._kv_shard_node_page_counts(node)):
+                    class_pages[owner] += count
+            if class_pages != self._kv_shard_evictable_pages:
+                E(
+                    f"[Size] KV shard evictable={self._kv_shard_evictable_pages} "
+                    f"!= recomputed={class_pages}"
+                )
+
         # ── PART 4: Size Accounting ──
         for ct in self.component_types:
             evictable = 0
@@ -2973,6 +3007,30 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             )
             for child in node.children.values():
                 stack.append((child, indent + 2))
+
+    def kv_shard_evictable_page_counts(self) -> list[int]:
+        """Unlocked Full pages per owner class, maintained without device reads."""
+        return list(self._kv_shard_evictable_pages)
+
+    def _kv_shard_node_page_counts(self, node: UnifiedTreeNode) -> list[int]:
+        value = node.component_data[BASE_COMPONENT_TYPE].value
+        assert node.rotation_base is not None
+        assert value is not None and len(value) % self.page_size == 0
+        return PageInterleavePoolAllocator._class_counts(
+            (node.rotation_base + node.kv_shard_start_page) % self.kv_shard_size,
+            len(value) // self.page_size,
+            self.kv_shard_size,
+        )
+
+    def adjust_kv_shard_evictable_pages(
+        self, node: UnifiedTreeNode, direction: int
+    ) -> None:
+        """Mirror a Full evictable-size transition in its class vector."""
+        if self.kv_shard_size <= 1:
+            return
+        for owner, count in enumerate(self._kv_shard_node_page_counts(node)):
+            self._kv_shard_evictable_pages[owner] += direction * count
+            assert self._kv_shard_evictable_pages[owner] >= 0
 
     def evictable_size(self) -> int:
         return self.component_evictable_size_.get(BASE_COMPONENT_TYPE, 0)

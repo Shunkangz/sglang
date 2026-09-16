@@ -422,6 +422,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """The hash chain of the node's ancestors, in root-to-parent order."""
         return node.get_prefix_hash_values(node.parent)
 
+    def kv_shard_evictable_page_counts(self) -> Optional[list[int]]:
+        """Per-owner recoverable pages, or None when this cache has no such view."""
+        return None
+
     def rotation_base_of(self, node: Any) -> Optional[int]:
         """Logical-page KV sharding: the rotation base stamped on ``node``.
 

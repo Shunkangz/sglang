@@ -3,7 +3,7 @@
 import unittest
 from array import array
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -13,9 +13,19 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ReqKvInfo
+from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.schedule_batch import (
+    NextBatchPlan,
+    Req,
+    ReqKvInfo,
+    ScheduleBatch,
+)
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
+from sglang.srt.mem_cache.page_interleave import PageShardSpec
+from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils.common import Range
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -182,6 +192,139 @@ class TestStashGatePreservesPrefixIndices(CustomTestCase):
             s, running_batch=s.running_batch, last_batch=s.last_batch
         )
         self.assertIsNone(s.chunked_req)
+
+
+class TestShardedParkedChunk(CustomTestCase):
+    def test_other_class_request_runs_without_counting_parked_chunk(self):
+        """Run real admission and batch construction; stop before forward setup."""
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+        allocator = PageInterleavePoolAllocator(
+            size=32,
+            physical_page_size=16,
+            shard_size=4,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+            shard_spec=PageShardSpec(
+                shard_rank=0,
+                shard_size=4,
+                page_size=16,
+                max_prefix_tokens=64,
+                chunk_tokens=64,
+            ),
+        )
+
+        def allocate_page(owner):
+            return allocator.alloc_extend(
+                prefix_lens=torch.tensor([0]),
+                prefix_lens_cpu=torch.tensor([0]),
+                seq_lens=torch.tensor([16]),
+                seq_lens_cpu=torch.tensor([16]),
+                last_loc=torch.tensor([-1]),
+                extend_num_tokens=16,
+                rotation_bases=[owner],
+            )
+
+        prefix = allocate_page(3)
+        allocate_page(0)
+        allocate_page(0)
+        self.assertEqual(allocator.class_free_page_counts(), [0, 2, 2, 1])
+
+        pool = _make_req_to_token_pool(8, 64)
+        pool.device = torch.device("cpu")
+        pool.available_size = lambda: 7
+        pool.mamba_allocator = None
+        pool.req_to_token[0, :16] = prefix.to(torch.int32)
+        cache = ChunkCache(
+            SimpleNamespace(
+                req_to_token_pool=pool,
+                token_to_kv_pool_allocator=allocator,
+                page_size=16,
+            )
+        )
+        parked = Req(
+            "parked",
+            "",
+            array("q", range(32)),
+            SamplingParams(max_new_tokens=1),
+        )
+        parked.kv.req_pool_idx = 0
+        parked.prefix_indices = prefix
+        parked.kv_rotation_base = 3
+        parked.set_extend_range(0, 16)
+        waiting = Req(
+            "other-class",
+            "",
+            array("q", range(15)),
+            SamplingParams(max_new_tokens=1),
+        )
+
+        scheduler = Scheduler.__new__(Scheduler)
+        for flag in (
+            "enable_hierarchical_cache",
+            "enable_unified_cache_external_linker",
+            "enable_hicache_storage",
+            "enable_priority_preemption",
+            "enable_priority_scheduling",
+            "is_hybrid_swa",
+            "enable_lora",
+            "is_mixed_chunk",
+            "enable_overlap",
+        ):
+            setattr(scheduler, flag, False)
+        scheduler.grammar_manager = MagicMock()
+        scheduler.grammar_manager.has_waiting_grammars.return_value = False
+        scheduler.min_free_slots_delayer = None
+        scheduler.dynamic_chunk_sizer = None
+        scheduler.dllm_config = None
+        scheduler.chunked_req = parked
+        scheduler.waiting_queue = [waiting]
+        scheduler.policy = MagicMock()
+        scheduler.get_num_allocatable_reqs = MagicMock(return_value=7)
+        scheduler.chunked_prefill_size = 64
+        scheduler.page_size = 16
+        scheduler.max_prefill_tokens = 64
+        scheduler.max_prefill_bs = 8
+        scheduler.max_running_requests = 8
+        scheduler.priority_scheduling_preemption_threshold = 0
+        scheduler.truncation_align_size = None
+        scheduler.new_token_ratio_tracker = SimpleNamespace(current=1.0)
+        scheduler.processed_tokens_counter = 0
+        scheduler.tree_cache = cache
+        scheduler.req_to_token_pool = pool
+        scheduler.token_to_kv_pool_allocator = allocator
+        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+        scheduler.tp_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                attn_backend=SimpleNamespace(extend_attention_block_m=64),
+                prefill_aware_swa=False,
+            )
+        )
+        scheduler.model_config = SimpleNamespace(vocab_size=100)
+        scheduler.spec_algorithm = MagicMock()
+        scheduler.load_inquirer = MagicMock()
+        scheduler.load_inquirer._get_num_pending_tokens.return_value = 16
+        running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
+
+        # Admission, queue filtering, and ScheduleBatch.init_new all execute.
+        # Tensor/sampling setup for the forward is outside this scheduler test.
+        with patch.object(ScheduleBatch, "prepare_for_extend") as prepare:
+            batch, _ = Scheduler._get_new_batch_prefill_raw(
+                scheduler, None, running_batch
+            )
+
+        prepare.assert_called_once()
+        self.assertEqual(batch.reqs, [waiting])
+        self.assertEqual(scheduler.waiting_queue, [])
+        self.assertIs(scheduler.chunked_req, parked)
+        self.assertEqual(parked.extend_range, Range(16, 16))
+        self.assertEqual(parked.inflight_middle_chunks, 0)
+        self.assertIsNone(batch.chunked_req)
+        self.assertIsNone(batch.chunked_req_next_prompt_token)
+        self.assertTrue(batch.contains_last_prefill_chunk)
+        self.assertEqual(waiting.kv_shard_admission_base, 1)
+        self.assertEqual(allocator.class_free_page_counts(), [0, 2, 2, 1])
 
 
 if __name__ == "__main__":

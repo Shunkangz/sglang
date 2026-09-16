@@ -194,6 +194,30 @@ def _evict_until_allocatable(
             return
 
 
+def evict_kv_shard_pages(
+    tree_cache: BasePrefixCache, required_pages: list[int]
+) -> bool:
+    """Evict until every owner class can supply the admitted batch's pages.
+
+    The existing eviction policy chooses victims; only pages freed in a class
+    with a shortfall satisfy that class's demand. Recheck after each pass so
+    unrelated free capacity cannot mask a shortage or trigger extra eviction.
+    """
+    allocator = tree_cache.token_to_kv_pool_allocator
+    while True:
+        shortfall = sum(
+            max(need - free, 0)
+            for need, free in zip(required_pages, allocator.class_free_page_counts())
+        )
+        if shortfall == 0:
+            return True
+        result = tree_cache.evict(
+            EvictParams(num_tokens=shortfall * allocator.page_size)
+        )
+        if result.num_tokens_evicted == 0:
+            return False
+
+
 def retraction_backup(
     req: Req,
     tree_cache: BasePrefixCache,

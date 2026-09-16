@@ -543,6 +543,7 @@ class SchedulePolicy:
 
 class AddReqResult(Enum):
     CONTINUE = auto()  # Continue to add requests
+    SKIP = auto()  # This request cannot fit; another request may use other classes
     NO_TOKEN = auto()  # No token left
     OTHER = auto()  # Other reasons to stop adding requests
 
@@ -679,17 +680,16 @@ class PrefillAdder:
         )
         self.kv_shard_block_bound_pages = 0
         self.kv_shard_chunk_pages = 0
-        # Per-request KV reserve charged at admission. Stock alloc_extend can
-        # consume up to one extra page per request beyond the extend length;
-        # under sharding the min-class admission gate needs one page per
-        # class (the ceil(K/N) rounding of cyclic class draws, phase-
-        # agnostic) -- reserve N*ps so admission defers (NO_TOKEN) instead of
-        # over-committing into the alloc path's fail-loud RuntimeError.
-        self.per_req_token_overhead = (
-            kv_shard_size * self.kv_shard_granule
-            if self.kv_shard_granule
-            else self.page_size
-        )
+        # Sharded PD prefill reserves exact physical pages per class. Decode
+        # runs on a different worker, so its future tokens do not consume this
+        # pool. The scalar budgets only track aggregate unreserved capacity.
+        self.kv_shard_reserved_pages = [0] * kv_shard_size
+        # Sharded admission reserves the exact per-class page counts above, so
+        # the scalar budget must not also charge the stock one-page alignment
+        # headroom -- see `_update_prefill_budget`.
+        self.per_req_token_overhead = 0 if self.kv_shard_granule else self.page_size
+        if self.kv_shard_granule:
+            self.memory_budget.total_offset = self.memory_budget.current_offset
         self.prefill_max_requests = prefill_max_requests
         self.prefill_delayer_single_pass = prefill_delayer_single_pass
         self.max_prefill_bs = max_prefill_bs
@@ -846,9 +846,9 @@ class PrefillAdder:
         self.memory_budget.reserve(
             extend_input_len,
             max_new_tokens,
-            # `reserve` charges one allocator page of alignment headroom; under
-            # sharding the reserve is one page per owner class, so top it up by
-            # the remaining N - 1 (0 for stock allocators).
+            # `reserve` charges one allocator page of alignment headroom;
+            # `per_req_token_overhead` restates that charge (0 under sharding,
+            # where admission already reserved exact per-class pages).
             extra_tokens=(
                 mamba_gap_reserve + self.per_req_token_overhead - self.page_size
             ),
@@ -948,7 +948,9 @@ class PrefillAdder:
         # Persist the release receipt.
         req.lock_receipt = self.tree_cache.inc_lock_ref(req.last_node).to_dec_params()
 
-    def _kv_shard_reserve_scratch(self, prefix_len: int, extend_len: int) -> bool:
+    def _kv_shard_reserve_scratch(
+        self, prefix_len: int, extend_len: int, *, commit: bool = True
+    ) -> bool:
         """Reserve assembly-scratch capacity for one sharded admission.
 
         The batch's prefix gather is padded to
@@ -988,9 +990,122 @@ class PrefillAdder:
                     "assembly scratch"
                 )
             return False
-        self.kv_shard_block_bound_pages = block
-        self.kv_shard_chunk_pages = chunk
+        if commit:
+            self.kv_shard_block_bound_pages = block
+            self.kv_shard_chunk_pages = chunk
         return True
+
+    def _add_kv_shard_req(
+        self,
+        req: Req,
+        has_chunked_req: bool,
+        truncation_align_size: Optional[int],
+        *,
+        continuing: bool = False,
+    ) -> AddReqResult:
+        """Admit one PD-prefill chunk against its exact owner-class demand.
+
+        Locks are acquired before counting recoverable pages: the candidate's
+        prefix may have supplied capacity credited to an earlier reservation.
+        Planning changes neither the allocator nor the request. Reservations
+        and the new-chain rotation are committed only after every gate passes.
+        """
+        prefix_len = len(req.prefix_indices)
+        extend_len = len(req.full_untruncated_fill_ids) - prefix_len
+        chunk_limit = self.rem_chunk_tokens
+        if chunk_limit is not None and chunk_limit <= 0:
+            return AddReqResult.OTHER
+        if self.cur_rem_tokens <= 0:
+            return AddReqResult.NO_TOKEN
+        if (
+            chunk_limit is None
+            and self.can_run_list
+            and self.ceil_paged_tokens(extend_len) >= self.rem_input_tokens
+        ):
+            return AddReqResult.OTHER
+
+        truncated = chunk_limit is not None and extend_len > chunk_limit
+        if truncated:
+            if has_chunked_req and not continuing:
+                return AddReqResult.SKIP
+            align = self.kv_shard_granule
+            extend_len = chunk_limit // align * align
+            if truncation_align_size is not None:
+                extend_len = extend_len // truncation_align_size * truncation_align_size
+            extend_len = (prefix_len + extend_len) // align * align - prefix_len
+        if extend_len <= 0:
+            return AddReqResult.OTHER
+
+        if (stop := self._check_prefill_tile_budget(extend_len)) is not None:
+            return stop
+        if not self._kv_shard_reserve_scratch(prefix_len, extend_len, commit=False):
+            return AddReqResult.OTHER
+
+        allocator = self.token_to_kv_pool_allocator
+        with self._lock_node(req.last_node):
+            base = None
+            if prefix_len:
+                base = self.tree_cache.rotation_base_of(req.last_node)
+                if base is None:
+                    base = req.kv_rotation_base
+                assert base is not None, "cached sharded prefix has no rotation base"
+
+            free = allocator.class_free_page_counts()
+            evictable = self.tree_cache.kv_shard_evictable_page_counts()
+            if evictable is None:
+                evictable = [0] * self.kv_shard_size
+            capacity = [f + e for f, e in zip(free, evictable)]
+
+            # Prefer a rotation that fits free pages before considering
+            # eviction. `plan_extend_pages` declines a negative budget, so an
+            # over-reserved class simply yields no plan.
+            plan = None
+            for supply in (free, capacity):
+                remaining = [
+                    available - reserved
+                    for available, reserved in zip(supply, self.kv_shard_reserved_pages)
+                ]
+                plan = allocator.plan_extend_pages(
+                    prefix_len, extend_len, base, remaining
+                )
+                if plan is not None:
+                    break
+            if plan is None:
+                # Do not mark the whole pool full: later requests may target
+                # classes that still have pages.
+                return AddReqResult.SKIP
+
+            if self.prefill_delayer_single_pass is not None:
+                allow = self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
+                    local_prefillable=True,
+                    running_batch=self.running_batch.batch_size(),
+                    max_prefill_bs=self.max_prefill_bs,
+                    max_running_requests=self.max_running_requests,
+                    waiting_queue_len=self.waiting_queue_len,
+                )
+                if not allow and not continuing:
+                    return AddReqResult.OTHER
+
+            base, pages = plan
+            self._kv_shard_reserve_scratch(prefix_len, extend_len)
+            self.kv_shard_reserved_pages = [
+                reserved + need
+                for reserved, need in zip(self.kv_shard_reserved_pages, pages)
+            ]
+            req.kv_shard_admission_base = base
+            req.set_extend_range(prefix_len, prefix_len + extend_len)
+            self.can_run_list.append(req)
+            if truncated and not continuing:
+                self.new_chunked_req = req
+            if not continuing:
+                self._req_inc_lock_ref(req)
+            self._update_prefill_budget(
+                0 if continuing else prefix_len, extend_len, 0, req.retracted_stain
+            )
+            if not continuing:
+                self._account_prefill_cache_admission(req, prefix_len)
+
+        return self.budget_state()
 
     def add_dllm_staging_req(self, req: Req):
         assert self.dllm_config is not None
@@ -1032,6 +1147,18 @@ class PrefillAdder:
         )
 
     def add_chunked_req(self, req: Req):
+        if self.kv_shard_granule:
+            self._add_kv_shard_req(req, True, None, continuing=True)
+            if not self.can_run_list or self.can_run_list[-1] is not req:
+                # Preserve the parked continuation without reporting a chunk
+                # that was not actually scheduled.
+                req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices))
+                return req
+            return (
+                req
+                if req.extend_range.end < len(req.full_untruncated_fill_ids)
+                else None
+            )
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
@@ -1125,12 +1252,12 @@ class PrefillAdder:
                 self.tree_cache.dec_lock_ref(last_node)
 
     def add_one_req_ignore_eos(self, req: Req):
+        if self.kv_shard_granule:
+            return self._add_kv_shard_req(req, False, None)
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
-        paged_input = (
-            self.ceil_paged_tokens(cand_extend_input_len) + self.per_req_token_overhead
-        )
+        paged_input = self.ceil_paged_tokens(cand_extend_input_len)
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into the
         # budget gate so admission can't over-commit (0 for baseline / non-Mamba).
         paged_input += self._mamba_gap_budget_for_req(req)
@@ -1279,6 +1406,9 @@ class PrefillAdder:
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
             return AddReqResult.OTHER
 
+        if self.kv_shard_granule:
+            return self._add_kv_shard_req(req, has_chunked_req, truncation_align_size)
+
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)
 
@@ -1292,7 +1422,7 @@ class PrefillAdder:
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
-        total_tokens = cand_extend_input_len + max_new + self.per_req_token_overhead
+        total_tokens = cand_extend_input_len + max_new + self.page_size
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into
         # `total_tokens` so both `rem_total_tokens` gates reflect the joint budget.
         # Read before `init_load_back` binds `req.mamba_pool_idx` — after that

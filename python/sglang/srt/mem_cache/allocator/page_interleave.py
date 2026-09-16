@@ -34,17 +34,15 @@ alloc/free stream, so the state is byte-identical across shard-group ranks
 by construction (SPMD, no consensus protocol). A freed page is immediately
 reusable: nothing strands a page until its whole logical group is free.
 
-``available_size`` reports the MIN-CLASS capacity floor
-(``N * min_r free_pages(r) * ps``): in-flight P/D transfers lock tree nodes,
-so an aggregate gate could admit a request whose tight class has nothing
-evictable — fail-loud where min-class admission defers. Rotation plus
-least-full seeding keeps the classes near-balanced, so the floor tracks the
-aggregate within the bounded skew.
+``available_size`` reports aggregate free tokens. Admission and allocation
+check exact per-class demand separately: a request can use a nonempty class
+even when another class is exhausted, while locked pages of the needed
+class never count as recoverable capacity.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Sequence
 
 import torch
 
@@ -132,16 +130,16 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
         ]
 
     def available_size(self) -> int:
-        # Min-class capacity floor: a K-page request needs up to
-        # ceil(K / N) pages of EACH class (cyclic draws), so admission must
-        # gate on the tightest class, not the aggregate — the aggregate can
-        # be large while one class is fully protected by locked chains.
+        # This scalar is useful for aggregate accounting only. Feasibility
+        # requires plan_extend_pages against the per-class capacity vector.
+        return self.aggregate_free_size()
+
+    def balanced_available_size(self) -> int:
+        """Capacity of complete owner cycles; a diagnostic, not an admission gate."""
         return self.shard_size * self.page_size * min(self.class_free_page_counts())
 
     def aggregate_free_size(self) -> int:
-        """Total free logical slots across all classes — the accounting
-        identity's `available` term (the invariant checker); NOT an admission
-        gate (see available_size)."""
+        """Total free logical slots across all owner classes."""
         return self.page_size * sum(self.class_free_page_counts())
 
     def least_full_class(self) -> int:
@@ -182,6 +180,53 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
             for c in range(shard_size)
         ]
 
+    def extend_class_counts(
+        self, prefix_len: int, extend_len: int, rotation_base: int
+    ) -> List[int]:
+        """Pages this extend draws from each owner class.
+
+        The chain's cyclic run resumes at the class its prefix ended on, so
+        the seed is the base advanced by the prefix's page count.
+        """
+        return self._class_counts(
+            (rotation_base + prefix_len // self.page_size) % self.shard_size,
+            -(-extend_len // self.page_size),
+            self.shard_size,
+        )
+
+    def plan_extend_pages(
+        self,
+        prefix_len: int,
+        extend_len: int,
+        rotation_base: Optional[int],
+        available_pages: Sequence[int],
+    ) -> Optional[tuple[int, List[int]]]:
+        """Plan one request without mutating the allocator or the supplied budget.
+
+        A cached prefix fixes its rotation. New chains try the least-full
+        classes first, skipping a seed whose cyclic run cannot fit. Callers
+        may supply free plus evictable pages minus earlier reservations;
+        the returned base must then be retained through allocation.
+        """
+        assert prefix_len % self.page_size == 0
+        assert extend_len > 0
+        assert len(available_pages) == self.shard_size
+        if any(count < 0 for count in available_pages):
+            return None
+        if rotation_base is None:
+            assert prefix_len == 0, "a cached prefix must carry its rotation base"
+            bases = sorted(
+                range(self.shard_size), key=lambda c: (-available_pages[c], c)
+            )
+        else:
+            assert 0 <= rotation_base < self.shard_size
+            bases = [rotation_base]
+        for base in bases:
+            counts = self.extend_class_counts(prefix_len, extend_len, base)
+            if all(need <= free for need, free in zip(counts, available_pages)):
+                return base, counts
+        return None
+
     def alloc_extend(
         self,
         prefix_lens: torch.Tensor,
@@ -206,9 +251,9 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
         Sync-free: per-class pop counts are closed-form from the host
         lengths and the host rotation bases (the reason the base is host
         metadata on radix nodes rather than derived from device locs).
-        Returns None when some needed class cannot supply its pages — the
-        caller's admission gate (min-class available_size + the N*ps
-        per-request reserve) makes that unreachable outside true OOM.
+        Returns None when some needed class cannot supply its pages. The
+        caller reserves these exact class counts and materializes any
+        required evictions before allocation.
         """
         ps, shard_size = self.page_size, self.shard_size
         bs = len(prefix_lens_cpu)
@@ -223,6 +268,7 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
         sim_counts = self.class_free_page_counts()
         start_classes: List[int] = []
         new_pages_list: List[int] = []
+        resolved_bases = []
         for i in range(bs):
             prefix_len = int(prefix_lens_cpu[i])
             seq_len = int(seq_lens_cpu[i])
@@ -233,17 +279,17 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
             )
             new_pages = -(-seq_len // ps) - prefix_len // ps
             assert new_pages > 0
-            if rotation_bases[i] is None:
-                # New chain: least-full over the simulated fills (mirrored).
-                rotation_bases[i] = max(
-                    range(shard_size), key=lambda r: (sim_counts[r], -r)
-                )
-            start_class = (rotation_bases[i] + prefix_len // ps) % shard_size
+            plan = self.plan_extend_pages(
+                prefix_len, seq_len - prefix_len, rotation_bases[i], sim_counts
+            )
+            if plan is None:
+                return None
+            base, counts = plan
+            resolved_bases.append(base)
+            start_class = (base + prefix_len // ps) % shard_size
             start_classes.append(start_class)
             new_pages_list.append(new_pages)
-            for c, need in enumerate(
-                self._class_counts(start_class, new_pages, shard_size)
-            ):
+            for c, need in enumerate(counts):
                 sim_counts[c] -= need
             if self.debug_mode and prefix_len > 0:
                 # Owner congruence of the prefix end: the host-tracked phase
@@ -260,8 +306,7 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
         assert extend_num_tokens == sum(
             int(seq_lens_cpu[i]) - int(prefix_lens_cpu[i]) for i in range(bs)
         )
-        if min(sim_counts) < 0:
-            return None
+        rotation_bases[:] = resolved_bases
         # Under need_sort the pops slice class_free_pages only; merge the
         # release lists in whenever any class's free list alone is shorter
         # than its total need (= total count - simulated remainder).

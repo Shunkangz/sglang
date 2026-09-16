@@ -25,6 +25,7 @@ from sglang.srt.mem_cache.common import (
     MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY,
     available_and_evictable_str,
     evict_from_tree_cache,
+    evict_kv_shard_pages,
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.runtime_context import attention_backends, get_parallel
@@ -182,16 +183,7 @@ def alloc_paged_token_slots_extend(
     req_pool_indices: Optional[torch.Tensor] = None,
     batch=None,
 ):
-    # Over estimate the number of tokens: assume each request needs a new page
-    # (one page per CLASS per request under sharding — the min-class
-    # availability floor must cover every request's ceil(K_i/N) rounding,
-    # matching the N*ps per-request admission reserve).
     allocator = tree_cache.token_to_kv_pool_allocator
-    num_tokens = extend_num_tokens + len(seq_lens_cpu) * (
-        allocator.page_size * page_interleave_shard_size(allocator)
-    )
-    evict_from_tree_cache(tree_cache, num_tokens)
-
     is_dsv4 = req_pool_indices is not None and hasattr(allocator, "c128_attn_allocator")
     extra_alloc_kwargs = {}
     kv_shard_rotation_bases = None
@@ -199,7 +191,44 @@ def alloc_paged_token_slots_extend(
         kv_shard_rotation_bases = _kv_shard_rotation_bases(
             tree_cache=tree_cache, batch=batch, prefix_lens_cpu=prefix_lens_cpu
         )
+        # Admission fixes new-chain rotations so eviction cannot redirect an
+        # already reserved page to a different class. Direct callers without
+        # admission can still choose a rotation from recoverable capacity.
+        free = allocator.class_free_page_counts()
+        evictable = tree_cache.kv_shard_evictable_page_counts()
+        capacity = [
+            f + e for f, e in zip(free, evictable or [0] * allocator.shard_size)
+        ]
+        required_pages = [0] * allocator.shard_size
+        for i, base in enumerate(kv_shard_rotation_bases):
+            prefix_len, seq_len = int(prefix_lens_cpu[i]), int(seq_lens_cpu[i])
+            if base is None:
+                plan = allocator.plan_extend_pages(
+                    prefix_len, seq_len - prefix_len, None, capacity
+                )
+                if plan is None:
+                    raise RuntimeError(
+                        "Sharded prefill demand exceeds recoverable pages"
+                    )
+                base, _ = plan
+                kv_shard_rotation_bases[i] = base
+            pages = allocator.extend_class_counts(
+                prefix_len, seq_len - prefix_len, base
+            )
+            required_pages = [a + b for a, b in zip(required_pages, pages)]
+            capacity = [a - b for a, b in zip(capacity, pages)]
+        if not evict_kv_shard_pages(tree_cache, required_pages):
+            raise RuntimeError(
+                "Sharded prefill out of memory after admission: "
+                f"required pages={required_pages}, "
+                f"free pages={allocator.class_free_page_counts()}"
+            )
         extra_alloc_kwargs["rotation_bases"] = kv_shard_rotation_bases
+    else:
+        # Stock paged allocators reserve one page of alignment headroom per
+        # request. Sharded allocation checks exact class demand above.
+        num_tokens = extend_num_tokens + len(seq_lens_cpu) * allocator.page_size
+        evict_from_tree_cache(tree_cache, num_tokens)
     if is_dsv4:
         c128_num_pages = allocator.c128_num_pages_needed(prefix_lens_cpu, seq_lens_cpu)
         allocator.ensure_c128_capacity(tree_cache, c128_num_pages)
@@ -243,6 +272,7 @@ def alloc_paged_token_slots_extend(
         # radix insert to stamp onto new tree nodes (UnifiedTreeNode.rotation_base).
         for req, base in zip(batch.reqs, kv_shard_rotation_bases):
             req.kv_rotation_base = base
+            req.kv_shard_admission_base = None
 
     return out_cache_loc
 
@@ -259,10 +289,9 @@ def _kv_shard_rotation_bases(
       another chain's canonical locs between chunks, changing the base. The
       read goes through ``tree_cache.rotation_base_of`` because the node
       handle is tree-specific (a NodeId on the unified tree).
-    - A request without a cached prefix starts a new chain: None here — the
-      allocator draws from the least-full class at that request's turn (so
-      the draw sees earlier requests' pops in the same batch) and resolves
-      the entry in place.
+    - A request without a cached prefix retains its admission-time rotation,
+      so eviction cannot change the owner classes already reserved for it.
+      Direct callers without an admission plan leave it None.
     - ChunkCache has no tree nodes (``last_node`` is None); its chunked
       continuations fall back to the base recorded on the request at the
       previous chunk's alloc (no cross-request reuse, no rebind there).
@@ -271,7 +300,7 @@ def _kv_shard_rotation_bases(
     bases = []
     for i, req in enumerate(batch.reqs):
         if int(prefix_lens_cpu[i]) == 0:
-            bases.append(None)
+            bases.append(getattr(req, "kv_shard_admission_base", None))
             continue
         node_base = tree_cache.rotation_base_of(req.last_node)
         if node_base is not None:

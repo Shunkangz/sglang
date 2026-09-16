@@ -129,12 +129,8 @@ class SchedulerInvariantChecker:
         ) and allocator.page_size > 1
         if widened_page_alloc:
             if kv_shard_size > 1:
-                # Rotated owner-classed KV sharding: the accounting identity
-                # needs the AGGREGATE free size — the admission-facing
-                # available_size() is the min-class capacity floor and
-                # under-reports the aggregate by the (bounded) class skew.
-                # The per-class free-page watermarks are exported alongside so
-                # a skewed class shows up in the log.
+                # Account for every free physical page and expose the class
+                # watermarks used by exact sharded admission alongside it.
                 full_available = allocator.aggregate_free_size()
                 class_watermark_msg = (
                     f", class_free_pages={allocator.class_free_page_counts()}"

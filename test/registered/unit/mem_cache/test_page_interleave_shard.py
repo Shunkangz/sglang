@@ -20,7 +20,7 @@ arithmetic that rotated owner-classed allocation hangs on:
    round-trip, disjoint equal partition across ranks.
 2. ``PageInterleavePoolAllocator`` — N mirrored class free lists, rotated
    class draws (owners exactly cyclic along a chain), least-full root
-   seeding, min-class admission accounting, zero stranding (a freed page is
+   seeding, exact class admission accounting, zero stranding (a freed page is
    immediately reusable).
 3. The host rotation base on ``UnifiedTreeNode`` — stamped at insert, copied
    on split, read through ``last_node``, and the pre-flight that declines an
@@ -64,7 +64,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.common import _evict_until_allocatable
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.page_interleave import (
     PageInterleavePlacement,
@@ -218,21 +217,41 @@ class TestClassedAllocator(CustomTestCase):
         self.assertEqual(alloc.available_size(), total)
         self.assertEqual(alloc.class_free_page_counts(), [32] * N)
 
-    def test_min_class_admission_accounting(self):
-        """available_size is the MIN-CLASS floor: draining one class must
-        zero the admission budget even while the aggregate stays large —
-        an aggregate gate would over-admit into the alloc path's fail-loud
-        RuntimeError when the tight class is protected."""
+    def test_free_capacity_does_not_hide_nonempty_classes(self):
         alloc = _make_allocator(pages_per_rank=4)
         outs = [_alloc_extend(alloc, 0, PS, rotation_base=3) for _ in range(4)]
         self.assertEqual(alloc.class_free_page_counts(), [4, 4, 4, 0])
-        self.assertEqual(alloc.available_size(), 0)
-        self.assertEqual(alloc.aggregate_free_size(), 12 * PS)
-        # A draw needing the empty class defers (None), never raises.
+        self.assertEqual(alloc.available_size(), 12 * PS)
+        self.assertEqual(alloc.balanced_available_size(), 0)
         self.assertIsNone(_alloc_extend(alloc, 0, N * PS, rotation_base=0))
-        # A free of one class-3 page lifts the floor by one page per class.
+        self.assertIsNotNone(_alloc_extend(alloc, 0, PS, rotation_base=1))
         alloc.free(outs[0])
-        self.assertEqual(alloc.available_size(), N * PS)
+        self.assertEqual(alloc.available_size(), 12 * PS)
+        self.assertEqual(alloc.balanced_available_size(), N * PS)
+
+    def test_class_plan_honors_phase_without_mutating_capacity(self):
+        alloc = _make_allocator()
+        supply = [0, 2, 2, 2]
+        self.assertEqual(alloc.plan_extend_pages(PS, PS, 0, supply), (0, [0, 1, 0, 0]))
+        self.assertIsNone(alloc.plan_extend_pages(0, PS, 0, supply))
+        self.assertEqual(supply, [0, 2, 2, 2])
+
+    def test_new_chain_plan_tries_a_feasible_rotation(self):
+        alloc = _make_allocator()
+        # The first most-free class would cross the empty class; seed 2 fits.
+        supply = [2, 0, 2, 2]
+        self.assertEqual(
+            alloc.plan_extend_pages(0, 2 * PS, None, supply), (2, [0, 0, 1, 1])
+        )
+        self.assertEqual(supply, [2, 0, 2, 2])
+
+    def test_failed_batch_preserves_unresolved_bases(self):
+        alloc = _make_allocator(pages_per_rank=1)
+        bases = [None, 0]
+        before = alloc.class_free_page_counts()
+        self.assertIsNone(_alloc_extend_batch(alloc, [0, 0], [PS, 4 * PS], bases))
+        self.assertEqual(bases, [None, 0])
+        self.assertEqual(alloc.class_free_page_counts(), before)
 
     def test_least_full_root_seeding(self):
         """Roots draw from the class with the most free pages (ties: lowest
@@ -406,22 +425,15 @@ class TestClassedAllocator(CustomTestCase):
         self.assertEqual(alloc.class_free_page_counts(), counts_before)
 
 
-class TestEvictUntilAllocatable(CustomTestCase):
-    """The evict-then-allocate contract under min-class accounting: one
-    evict() sized in tokens can raise the tight class by less than the
-    tokens it freed (evicted pages spread across classes), so the alloc
-    path iterates. Guards the two termination conditions of
-    _evict_until_allocatable."""
-
+class TestEvictKVShardPages(CustomTestCase):
     def _allocator_with_tight_class(self):
         alloc = _make_allocator(pages_per_rank=4)
-        # Four 1-page chains, all in class 3: the tight class.
         outs = [_alloc_extend(alloc, 0, PS, rotation_base=3) for _ in range(4)]
-        assert alloc.available_size() == 0
+        assert alloc.class_free_page_counts() == [4, 4, 4, 0]
         return alloc, outs
 
     def _tree_stub(self, alloc, frees):
-        stub = SimpleNamespace(calls=0)
+        stub = SimpleNamespace(calls=0, token_to_kv_pool_allocator=alloc)
 
         def evict(params):
             stub.calls += 1
@@ -434,20 +446,39 @@ class TestEvictUntilAllocatable(CustomTestCase):
         stub.evict = evict
         return stub
 
-    def test_iterates_until_min_class_covers(self):
+    def test_iterates_until_needed_class_fits(self):
+        from sglang.srt.mem_cache.common import evict_kv_shard_pages
+
         alloc, outs = self._allocator_with_tight_class()
-        # Each round frees ONE class-3 page (a whole 1-page chain): reaching
-        # a min-class floor of 2 pages takes 2 rounds.
         tree = self._tree_stub(alloc, list(outs))
-        _evict_until_allocatable(tree, alloc, 2 * N * PS)
-        self.assertGreaterEqual(alloc.available_size(), 2 * N * PS)
+        self.assertTrue(evict_kv_shard_pages(tree, [0, 0, 0, 2]))
+        self.assertEqual(alloc.class_free_page_counts()[3], 2)
+        self.assertEqual(tree.calls, 2)
+
+    def test_sufficient_other_class_needs_no_eviction(self):
+        from sglang.srt.mem_cache.common import evict_kv_shard_pages
+
+        alloc, outs = self._allocator_with_tight_class()
+        tree = self._tree_stub(alloc, list(outs))
+        self.assertTrue(evict_kv_shard_pages(tree, [0, 1, 0, 0]))
+        self.assertEqual(tree.calls, 0)
+
+    def test_frees_in_wrong_class_cannot_satisfy_demand(self):
+        from sglang.srt.mem_cache.common import evict_kv_shard_pages
+
+        alloc, _ = self._allocator_with_tight_class()
+        wrong_class = _alloc_extend(alloc, 0, PS, rotation_base=0)
+        tree = self._tree_stub(alloc, [wrong_class])
+        self.assertFalse(evict_kv_shard_pages(tree, [0, 0, 0, 1]))
+        self.assertEqual(alloc.class_free_page_counts()[3], 0)
         self.assertEqual(tree.calls, 2)
 
     def test_terminates_when_tree_dry(self):
+        from sglang.srt.mem_cache.common import evict_kv_shard_pages
+
         alloc, _ = self._allocator_with_tight_class()
-        tree = self._tree_stub(alloc, [])  # nothing evictable
-        _evict_until_allocatable(tree, alloc, PS)
-        self.assertEqual(alloc.available_size(), 0)  # need unmet, but no hang
+        tree = self._tree_stub(alloc, [])
+        self.assertFalse(evict_kv_shard_pages(tree, [0, 0, 0, 1]))
         self.assertEqual(tree.calls, 1)
 
 
@@ -509,6 +540,80 @@ def _node(tree, node_id):
 def _match_len(tree, tokens):
     res = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
     return len(res.device_indices)
+
+
+class TestShardEvictableCounts(CustomTestCase):
+    def _tree(self):
+        return UnifiedRadixCache(
+            CacheInitParams(
+                disable=False,
+                req_to_token_pool=ReqToTokenPool(
+                    size=8, max_context_len=256, device="cpu", enable_memory_saver=False
+                ),
+                token_to_kv_pool_allocator=_make_allocator(pages_per_rank=8),
+                page_size=PS,
+                eviction_policy="lru",
+                tree_components=(ComponentType.FULL,),
+            )
+        )
+
+    def test_split_lock_unlock_and_eviction_keep_class_counts(self):
+        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+
+        tree = self._tree()
+        alloc = tree.token_to_kv_pool_allocator
+        tokens = list(range(6 * PS))
+        values = _alloc_extend(alloc, 0, len(tokens), rotation_base=2)
+        _insert(tree, tokens, rotation_base=2, value=values)
+        self.assertEqual(tree.kv_shard_evictable_page_counts(), [1, 1, 2, 2])
+        # Matching a shorter prefix splits the node; the tail begins at P2.
+        match = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens[: 2 * PS])))
+        )
+        prefix = match.last_device_node
+        self.assertEqual(tree.kv_shard_evictable_page_counts(), [1, 1, 2, 2])
+        outer = tree.inc_lock_ref(prefix)
+        self.assertEqual(tree.kv_shard_evictable_page_counts(), [1, 1, 1, 1])
+        inner = tree.inc_lock_ref(prefix)
+        tree.dec_lock_ref(prefix, inner.to_dec_params())
+        self.assertEqual(tree.kv_shard_evictable_page_counts(), [1, 1, 1, 1])
+        # Only the unlocked tail can be evicted while the prefix stays locked.
+        tree.evict(EvictParams(num_tokens=1000))
+        self.assertEqual(tree.kv_shard_evictable_page_counts(), [0, 0, 0, 0])
+        tree.dec_lock_ref(prefix, outer.to_dec_params())
+        self.assertEqual(tree.kv_shard_evictable_page_counts(), [0, 0, 1, 1])
+        tree.tree_core.sanity_check([], [])
+        tree.reset()
+        self.assertEqual(tree.kv_shard_evictable_page_counts(), [0] * N)
+
+    def test_splitting_a_locked_node_does_not_add_evictable_credit(self):
+        tree = self._tree()
+        alloc = tree.token_to_kv_pool_allocator
+        tokens = list(range(6 * PS))
+        values = _alloc_extend(alloc, 0, len(tokens), rotation_base=1)
+        _insert(tree, tokens, rotation_base=1, value=values)
+        full = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)))
+        ).last_device_node
+        lock = tree.inc_lock_ref(full)
+        tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens[:PS]))))
+        self.assertEqual(tree.kv_shard_evictable_page_counts(), [0] * N)
+        tree.dec_lock_ref(full, lock.to_dec_params())
+        self.assertEqual(tree.kv_shard_evictable_page_counts(), [1, 2, 2, 1])
+        tree.tree_core.sanity_check([], [])
+
+    def test_appended_segment_uses_its_absolute_position(self):
+        tree = self._tree()
+        alloc = tree.token_to_kv_pool_allocator
+        tokens = list(range(3 * PS))
+        prefix_values = _alloc_extend(alloc, 0, 2 * PS, rotation_base=3)
+        _insert(tree, tokens[: 2 * PS], rotation_base=3, value=prefix_values)
+        tail_values = _alloc_extend(alloc, 2 * PS, 3 * PS, rotation_base=3)
+        _insert(
+            tree, tokens, rotation_base=3, value=torch.cat([prefix_values, tail_values])
+        )
+        self.assertEqual(tree.kv_shard_evictable_page_counts(), [1, 1, 0, 1])
+        tree.tree_core.sanity_check([], [])
 
 
 class TestUnifiedRotationBase(CustomTestCase):
