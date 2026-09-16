@@ -186,6 +186,28 @@ class PageInterleaveKVPoolMixin:
             "(it writes pool rows directly, bypassing the ownership filter)"
         )
 
+    def register_layer_transfer_counter(self, layer_transfer_counter):
+        # `None` is the in-tree "disable" signal from the SWA/hybrid wrappers,
+        # so it has to stay a no-op.
+        if layer_transfer_counter is None:
+            super().register_layer_transfer_counter(None)
+            return
+        # Layer-wise KV load-back is unsupported here, and refusing it at
+        # registration is the only safe answer. The gather in `_prefetch_layer`
+        # reads pool rows directly (`_gather_pairs`), so it never passes
+        # through the base getters' `wait_until` hook -- and the first gather
+        # is kicked from `begin_shard_extend`, before any getter runs. Adding
+        # the wait would not make the combination work: the loader writes whole
+        # pool rows at LOGICAL indices with no ownership filter, while this
+        # pool's rows are local physical ones, so ordering the read would only
+        # turn a race into a silent wrong-row read. Same reason as
+        # `set_kv_buffer_prefix_valid` above.
+        raise NotImplementedError(
+            "layer-wise KV load-back (HiCache / external linker) is "
+            "unsupported under logical-page KV sharding (the gather reads "
+            "pool rows directly and the load-back writes them unfiltered)"
+        )
+
     # ---- subclass hooks -------------------------------------------------------
 
     def _scratch_tensor_specs(self, rows: int) -> Dict[str, torch.Tensor]:

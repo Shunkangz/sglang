@@ -1016,6 +1016,35 @@ class TestBeginShardExtendPlan(CustomTestCase):
         self.assertIn("cyclic", str(ctx.exception))
 
 
+class TestLayerTransferCounterRefused(CustomTestCase):
+    """Layer-wise KV load-back must fail loud at registration.
+
+    The gather reads pool rows directly (`_gather_pairs`), so it never passes
+    through the base getters' `layer_transfer_counter.wait_until` hook, and
+    `begin_shard_extend` kicks the first gather before any getter runs.
+    """
+
+    class _Base:
+        def register_layer_transfer_counter(self, counter):
+            self.counter = counter
+
+    class _Pool(PageInterleaveKVPoolMixin, _Base):
+        def __init__(self):
+            pass
+
+    def test_a_real_counter_is_refused(self):
+        pool = self._Pool()
+        with self.assertRaises(NotImplementedError) as cm:
+            pool.register_layer_transfer_counter(object())
+        self.assertIn("logical-page KV sharding", str(cm.exception))
+
+    def test_none_stays_a_no_op(self):
+        """The SWA/hybrid wrappers disable the counter by passing None."""
+        pool = self._Pool()
+        pool.register_layer_transfer_counter(None)
+        self.assertIsNone(pool.counter)
+
+
 class TestScratchTranslation(CustomTestCase):
     def _plan(self, base=2, n_prefix=7, n_chunk=9, rank=1):
         pages = _chain_pages(base=base, n_pages=n_prefix + n_chunk)
