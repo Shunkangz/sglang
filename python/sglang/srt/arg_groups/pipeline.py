@@ -300,6 +300,12 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # Handle context parallelism.
     run_hook(handle_context_parallelism, server_args)
 
+    # Validate logical-page KV cache sharding after its page size, attention
+    # backend, memory budget, and shard topology have all resolved.
+    from sglang.srt.arg_groups.kv_shard_hook import handle_kv_cache_sharding
+
+    run_hook(handle_kv_cache_sharding, server_args)
+
     # Handle MoE configurations.
     from sglang.srt.arg_groups.moe_hook import (
         handle_a2a_moe,
@@ -371,6 +377,11 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_model_capability_adjustments, server_args)
 
     finalize_cuda_graph_prefill_max_context(server_args)
+
+    # Capability adjustments can late-force a different attention backend or
+    # disable chunked prefill. Re-run the idempotent sharding gate over the
+    # final resolving view.
+    run_hook(handle_kv_cache_sharding, server_args)
 
     # Validate after all batch-size declarations are visible.
     run_hook(validate_deepep_v2_speculative_draft, server_args)
