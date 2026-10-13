@@ -8,7 +8,7 @@ import threading
 import time
 import uuid
 from collections import defaultdict
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -2646,7 +2646,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 prefill_state_indices[i] if i < len(prefill_state_indices) else None
             )
             if src_indices is None or (
-                len(src_indices) == 0 and st != StateType.DSA_TAIL
+                len(src_indices) == 0
+                and st != StateType.DSA_TAIL
+                and not (st == StateType.DSA and self.kv_shard_size > 1)
             ):
                 continue
             src_ptrs = src_state_data_ptrs[i] if i < len(src_state_data_ptrs) else []
@@ -2726,6 +2728,14 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     comp_notif,
                 )
             elif st == StateType.DSA:
+                src_indices, dst_indices = self._prepare_dsa_state_indices(
+                    src_indices, dst_indices
+                )
+                if len(src_indices) == 0:
+                    # Every source must satisfy decode's state completion count,
+                    # including owners with no pages in a short/cached prompt.
+                    self.agent.send_notif(peer_name, comp_notif.encode("ascii"))
+                    continue
                 if len(src_indices) != len(dst_indices):
                     raise RuntimeError(
                         f"State index length mismatch at component {i}: "
@@ -2821,7 +2831,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         self,
         bootstrap_room: int,
         kv_indices: npt.NDArray[np.int32],
-        index_slice: slice,
+        index_slice: Union[slice, npt.NDArray[np.int64]],
         is_last_chunk: bool,
         chunk_id: int,
         aux_index: Optional[int] = None,

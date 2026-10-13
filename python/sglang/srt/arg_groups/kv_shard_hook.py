@@ -14,7 +14,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     use_mla_backend,
 )
-from sglang.srt.configs.model_config import is_deepseek_dsa
+from sglang.srt.configs.model_config import get_dsa_index_kpool, is_deepseek_dsa
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import attn_dp_enabled_of
@@ -26,12 +26,43 @@ logger = logging.getLogger(__name__)
 def validate_kv_shard_attention_backend(server_args: Any, cfg: Any = None) -> None:
     cfg = cfg or resolving_view(server_args)
     prefill_backend, _ = attention_backends_of(resolved_view(server_args))
+    if prefill_backend == "dsa":
+        from sglang.srt.configs.hybrid_arch import mambaish_config
+
+        model_config = model_config_of(server_args)
+        if not use_mla_backend(server_args) or not is_deepseek_dsa(
+            model_config.hf_config
+        ):
+            raise ValueError("KV sharding with dsa requires a DSA MLA model.")
+        if cfg.device != "cuda" or cfg.dsa_prefill_backend not in (
+            "flashmla_sparse",
+            "flashmla_kv",
+            "trtllm",
+        ):
+            raise ValueError(
+                "KV sharding with dsa requires CUDA and --dsa-prefill-backend "
+                "flashmla_sparse, flashmla_kv, or trtllm."
+            )
+        if get_dsa_index_kpool(model_config.hf_config) != 1:
+            raise ValueError("KV sharding with dsa requires index_kpool=1.")
+        if model_config.is_hybrid_swa or mambaish_config(model_config) is not None:
+            raise ValueError("KV sharding with dsa does not support hybrid KV pools.")
+        if cfg.enable_dsa_cache_layer_split:
+            raise ValueError(
+                "--enable-kv-cache-sharding and --enable-dsa-cache-layer-split "
+                "are mutually exclusive KV layouts."
+            )
+        if cfg.attn_cp_size > 1 and cfg.cp_strategy != "interleave":
+            raise ValueError("KV sharding with dsa requires interleave prefill CP.")
+        if cfg.disable_chunked_prefix_cache:
+            raise ValueError("KV sharding with dsa requires chunked prefix caching.")
+        return
     if prefill_backend == "fa3":
         return
     if prefill_backend != "trtllm_mla":
         raise ValueError(
             "--enable-kv-cache-sharding currently requires the fa3 prefill "
-            "attention backend, or trtllm_mla for plain-TP MLA; "
+            "attention backend, trtllm_mla for plain-TP MLA, or dsa; "
             f"got {prefill_backend!r}."
         )
     if not use_mla_backend(server_args):
@@ -168,6 +199,12 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
         )
 
     validate_kv_shard_attention_backend(server_args, cfg)
+    if cfg.disaggregation_enable_kv_checksum:
+        raise ValueError(
+            "--enable-kv-cache-sharding does not support "
+            "--disaggregation-enable-kv-checksum: checksums address complete "
+            "logical pages, while each rank stores only its local stripe."
+        )
     if cfg.disaggregation_transfer_backend not in ("mooncake", "nixl"):
         raise ValueError(
             "--enable-kv-cache-sharding currently only supports the mooncake "
@@ -184,10 +221,13 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
         )
 
     if use_mla_backend(server_args):
-        if is_deepseek_dsa(model_config.hf_config):
+        if (
+            is_deepseek_dsa(model_config.hf_config)
+            and attention_backends_of(resolved_view(server_args))[0] != "dsa"
+        ):
             raise ValueError(
-                "--enable-kv-cache-sharding does not support DSA models yet "
-                "(indexer buffers are not striped)."
+                "--enable-kv-cache-sharding for DSA models requires the dsa "
+                "prefill attention backend."
             )
         if cfg.attn_cp_size <= 1:
             if attn_dp_enabled_of(cfg):
