@@ -1875,13 +1875,21 @@ def _set_envs_and_config(server_args: ServerArgs):
         os.environ["NCCL_CUMEM_ENABLE"] = str(
             int(cfg.enable_symm_mem or kv_shard_zero_sm_gather)
         )
+    # The multicast transport of that gather copies into the window's NVLS
+    # multicast VA, which NCCL returns as NULL with NVLS off.
+    kv_shard_multicast_gather = (
+        kv_shard_zero_sm_gather
+        and envs.SGLANG_KV_SHARD_GATHER_TRANSPORT.get() == "multicast"
+    )
     if (
         "NCCL_NVLS_ENABLE" not in os.environ
         or cfg.enable_nccl_nvls
         or cfg.enable_symm_mem
     ):
         os.environ["NCCL_NVLS_ENABLE"] = str(
-            int(cfg.enable_nccl_nvls or cfg.enable_symm_mem)
+            int(
+                cfg.enable_nccl_nvls or cfg.enable_symm_mem or kv_shard_multicast_gather
+            )
         )
     if "NCCL_GRAPH_MIXING_SUPPORT" not in os.environ or cfg.enable_symm_mem:
         # Note(wh): NCCL_GRAPH_MIXING_SUPPORT=0 can help improve performance for symmetric kernels.

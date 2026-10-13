@@ -571,6 +571,16 @@ class Envs:
     # copy engines (zero SMs) when the shard group is on one node. Needs NCCL
     # cuMem, which the engine then defaults on for single-node deployments.
     SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER = EnvBool(True)
+    # Transport of that zero-SM gather: "nccl" (NCCL copy-engine allgather) or
+    # "multicast" (copy-engine copies into the scratch window's NVLS multicast
+    # VA, in SGLANG_KV_SHARD_GATHER_CHUNK_MB chunks; needs NVLS).
+    SGLANG_KV_SHARD_GATHER_TRANSPORT = EnvStr("nccl")
+    SGLANG_KV_SHARD_GATHER_CHUNK_MB = EnvInt(8)
+    # With the multicast transport, stop each rank's gather copies at the next
+    # chunk boundary while the forward runs its latency-critical collectives.
+    # Opt-in: a paused gate stalls every stream that shares its hardware queue
+    # (CUDA_DEVICE_MAX_CONNECTIONS), which hangs if a resume is queued behind it.
+    SGLANG_ENABLE_KV_SHARD_GATHER_PAUSE = EnvBool(False)
 
     # Attention (aiter, ROCm): route NEXTN spec draft_extend (EAGLE-v2 KV
     # catch-up) through aiter unified_attention (GQA-packed + split-KV) instead

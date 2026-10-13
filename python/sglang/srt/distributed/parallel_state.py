@@ -46,6 +46,9 @@ from torch.distributed import Backend, ProcessGroup
 
 from sglang.srt import platforms
 from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.distributed.device_communicators.multicast_gather import (
+    pauses_background_gather,
+)
 from sglang.srt.distributed.utils import (
     all_gather_single,
     reduce_scatter_single,
@@ -690,6 +693,9 @@ class GroupCoordinator:
             with maybe_pynccl_context, maybe_pymscclpp_context:
                 yield graph_capture_context
 
+    # The MoE all-reduce of a sharded prefill yields NVLink to a KV-shard
+    # prefix gather in flight.
+    @pauses_background_gather
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         """
         User-facing all-reduce function before we actually call the

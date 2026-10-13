@@ -35,7 +35,8 @@ allocation hangs on:
 The GPU tests exercise real pools and NCCL collectives: MLA and MHA gathers
 on 2 ranks (``TestPageInterleaveGatherMultiGpu``), the copy-engine gather's
 symmetric window, its zero-kernel launch, its release, and the cross-node
-fallback (``TestPageInterleaveZeroSmGatherMultiGpu``),
+fallback (``TestPageInterleaveZeroSmGatherMultiGpu``), the pausable multicast
+transport (``TestPageInterleaveMulticastGatherMultiGpu``),
 and byte-exact DSA indexer keys, scales, and latent KV on 2 and 4 ranks
 (``TestPageInterleaveIndexer``), including dequantized MLA reads from packed
 FP8 scratch.
@@ -48,6 +49,7 @@ import math
 import os
 import shutil
 import tempfile
+import time
 import unittest
 import unittest.mock
 from array import array
@@ -62,6 +64,13 @@ from sglang.srt.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+from sglang.srt.distributed.device_communicators.multicast_gather import (
+    MulticastAllGather,
+    background_gather_paused,
+    get_active_pausable_gather,
+    set_active_pausable_gather,
+)
+from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache import page_interleave
@@ -1027,6 +1036,7 @@ def _make_pool_stub(spec, shard_rank=0, debug=True, table_pages=4096):
     stub._write_plan_key = stub._write_plan = None
     stub._translate_cache = {}
     stub._debug_plan_checks = debug
+    stub._pausable_gather = None
     stub.translate_loc_to_scratch = lambda loc: (
         PageInterleaveKVPoolMixin.translate_loc_to_scratch(stub, loc)
     )
@@ -1701,6 +1711,7 @@ def _run_mha(rank, world, port):
     torch.distributed.barrier()
     if rank == 0:
         print("PASS: MHA page-interleave shard (attn-CP axis)")
+    return pool, req_to_token, prefix_len, seq_len
 
 
 @unittest.skipIf(
@@ -1815,6 +1826,157 @@ class TestPageInterleaveZeroSmGatherMultiGpu(CustomTestCase):
             mp.spawn(
                 _run_cross_node_mla,
                 args=(_GATHER_WORLD, 29811),
+                nprocs=_GATHER_WORLD,
+                join=True,
+            )
+
+
+class _FakePausableGather:
+    """Records the pause/resume calls a bracket makes."""
+
+    def __init__(self):
+        self.calls = []
+
+    def pause_current_stream(self):
+        self.calls.append("pause")
+        return "stream"
+
+    def resume(self, stream):
+        self.calls.append(("resume", stream))
+
+
+class TestBackgroundGatherBrackets(CustomTestCase):
+    def setUp(self):
+        self.gather = _FakePausableGather()
+        set_active_pausable_gather(self.gather)
+        self.addCleanup(set_active_pausable_gather, None)
+
+    def test_group_coordinator_all_reduce_pauses_the_gather(self):
+        """Regression: the MoE all-reduce reached flashinfer through
+        GroupCoordinator.all_reduce and ran unpaused under the gather."""
+        stub = SimpleNamespace(world_size=1)
+        x = torch.ones(4)
+        self.assertIs(GroupCoordinator.all_reduce(stub, x), x)
+        self.assertEqual(self.gather.calls, ["pause", ("resume", "stream")])
+
+    def test_nested_brackets_resume_only_at_the_outermost_exit(self):
+        """An inner collective's resume must not unpause the outer one."""
+        with background_gather_paused():
+            with background_gather_paused():
+                pass
+            self.assertEqual(self.gather.calls, ["pause"])
+        self.assertEqual(self.gather.calls, ["pause", ("resume", "stream")])
+
+    def test_no_active_gather_issues_nothing(self):
+        set_active_pausable_gather(None)
+        with background_gather_paused():
+            pass
+        GroupCoordinator.all_reduce(SimpleNamespace(world_size=1), torch.ones(1))
+        self.assertEqual(self.gather.calls, [])
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA device")
+class TestGatedChunkChain(CustomTestCase):
+    """One rank, with the window's local VA standing in for its multicast VA:
+    the gate, chain and barrier stream mechanics without NVLS."""
+
+    def _gather(self, *, data_bytes, chunk_bytes):
+        window = torch.zeros(data_bytes + 4096, dtype=torch.uint8, device="cuda")
+        gather = MulticastAllGather(
+            rank=0,
+            world_size=1,
+            device_index=window.device.index,
+            local_base=window.data_ptr(),
+            multicast_base=window.data_ptr(),
+            control_offset=data_bytes,
+            chunk_bytes=chunk_bytes,
+            gated=True,
+        )
+        gather.init_control(window)
+        torch.cuda.synchronize()
+        return window, gather
+
+    def test_chunks_alternating_streams_are_joined_to_the_caller(self):
+        """Chunks alternate between the caller's stream and a side stream;
+        whether the last one ran on either, the caller's stream sees every
+        byte right after the call. The chunks are large enough that reading
+        before the side stream's last copy retires sees zeros."""
+        chunk = 256 << 20
+        window, gather = self._gather(data_bytes=4 * chunk, chunk_bytes=chunk)
+        src = torch.randint(0, 255, (4 * chunk,), dtype=torch.uint8, device="cuda")
+        stream = torch.cuda.current_stream()
+        # 3 chunks (the last on the caller), then 4 (the last on the side).
+        blocks = [
+            (src.data_ptr(), 0, 3 * chunk),
+            (src.data_ptr() + 3 * chunk, 3 * chunk, chunk),
+        ]
+        for n_blocks in (1, 2):
+            window[: 4 * chunk].zero_()
+            gather.all_gather(blocks[:n_blocks], stream)
+            n = sum(nbytes for _, _, nbytes in blocks[:n_blocks])
+            self.assertTrue(torch.equal(window[:n], src[:n]), f"{n_blocks} blocks")
+
+
+def _run_multicast_mha(rank, world, port):
+    pool, req_to_token, prefix_len, seq_len = _run_mha(rank, world, port)
+    gather = pool._mc_gather
+    assert gather is not None and pool._pausable_gather is gather
+    activity = _gather_gpu_activity(pool, req_to_token, prefix_len, seq_len)
+    nccl_kernels = sorted({name for name in activity if "nccl" in name.lower()})
+    assert not nccl_kernels, f"multicast gather launched NCCL kernels: {nccl_kernels}"
+    assert get_active_pausable_gather() is gather
+    pool.end_shard_extend()
+    assert get_active_pausable_gather() is None
+
+    # A gather enqueued while one rank is paused completes on no rank until
+    # that rank resumes from a stream the gather does not block.
+    cpu_group = get_parallel().attn_cp_group.cpu_group
+    pool.begin_shard_extend(req_to_token, torch.tensor([0]), [prefix_len], [seq_len])
+    prefix_rows = pool.translate_loc_to_scratch(req_to_token[0, :prefix_len].long())
+    expected = pool.get_key_buffer(pool.start_layer)[prefix_rows].clone()
+    slot = pool._slots[pool.start_layer % 2]
+    slot.tensors["k"].zero_()
+    # Drain the next layer's prefetch first: a paused gather would hang a
+    # device-wide sync.
+    torch.cuda.synchronize()
+    torch.distributed.barrier(group=cpu_group)
+    control = torch.cuda.Stream()
+    if rank == 0:
+        gather.pause(control)
+        control.synchronize()
+    torch.distributed.barrier(group=cpu_group)
+    pool.begin_shard_extend(req_to_token, torch.tensor([0]), [prefix_len], [seq_len])
+    time.sleep(0.2)
+    stalled = not slot.ready.query()
+    # Host-only barrier: a device-wide sync here would wait on rank 0's gather.
+    torch.distributed.barrier(group=cpu_group)
+    if rank == 0:
+        gather.resume(control)
+    slot.ready.synchronize()
+    assert stalled, f"[rank {rank}] gather finished while rank 0 was paused"
+    _check(rank, "mha k after resume", slot.tensors["k"][prefix_rows], expected)
+    torch.distributed.barrier()
+
+
+@unittest.skipIf(
+    torch.cuda.device_count() < 2, "page-interleave gather needs 2 CUDA devices"
+)
+class TestPageInterleaveMulticastGatherMultiGpu(CustomTestCase):
+    def test_pausable_multicast_gather(self):
+        """The multicast transport assembles the same K/V prefix without NCCL
+        kernels, and a paused rank holds every rank's gather until resumed."""
+        if torch.cuda.nccl.version() < (2, 28, 0):
+            self.skipTest("NCCL symmetric windows need NCCL >= 2.28")
+        # The multicast VA needs cuMem and NVLS; the ranks inherit both.
+        with (
+            temp_set_env(NCCL_CUMEM_ENABLE="1", NCCL_NVLS_ENABLE="1"),
+            envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.override(True),
+            envs.SGLANG_KV_SHARD_GATHER_TRANSPORT.override("multicast"),
+            envs.SGLANG_ENABLE_KV_SHARD_GATHER_PAUSE.override(True),
+        ):
+            mp.spawn(
+                _run_multicast_mha,
+                args=(_GATHER_WORLD, 29813),
                 nprocs=_GATHER_WORLD,
                 join=True,
             )

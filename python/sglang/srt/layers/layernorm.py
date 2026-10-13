@@ -26,6 +26,9 @@ from sglang.srt.batch_invariant_ops import (
     is_batch_invariant_mode_enabled,
     rms_norm_batch_invariant,
 )
+from sglang.srt.distributed.device_communicators.multicast_gather import (
+    background_gather_paused,
+)
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -238,23 +241,25 @@ def _forward_with_allreduce_fusion(
                 if fused_result is not None:
                     return fused_result
             else:
-                fused_result = flashinfer_allreduce_residual_rmsnorm(
-                    input_tensor=x,
-                    residual=residual,
-                    weight=weight,
-                    eps=norm_module.variance_epsilon,
-                    max_token_num=max(x.shape[0], 2048),
-                    use_attn_tp_group=use_attn_tp_group,
-                )
-                if fused_result[0] is not None:
-                    return fused_result
-                # The kernel declined: all-reduce over the group its workspace
-                # is built on, then add and norm into a new residual tensor, as
-                # the kernel does.
-                if use_attn_tp_group:
-                    x = attention_tensor_model_parallel_all_reduce(x)
-                else:
-                    x = deferred_post_experts_all_reduce(x)
+                # A KV-shard prefix gather in flight yields NVLink to this one.
+                with background_gather_paused():
+                    fused_result = flashinfer_allreduce_residual_rmsnorm(
+                        input_tensor=x,
+                        residual=residual,
+                        weight=weight,
+                        eps=norm_module.variance_epsilon,
+                        max_token_num=max(x.shape[0], 2048),
+                        use_attn_tp_group=use_attn_tp_group,
+                    )
+                    if fused_result[0] is not None:
+                        return fused_result
+                    # The kernel declined: all-reduce over the group its
+                    # workspace is built on, then add and norm into a new
+                    # residual tensor, as the kernel does.
+                    if use_attn_tp_group:
+                        x = attention_tensor_model_parallel_all_reduce(x)
+                    else:
+                        x = deferred_post_experts_all_reduce(x)
                 if post_residual_addition is None:
                     residual = residual.clone()
                 return norm_module.forward(x, residual, None)
