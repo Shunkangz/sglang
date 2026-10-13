@@ -2015,6 +2015,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         continue
                 src_indices = list(indices)
                 dst_indices_local = list(dst_indices)
+                if st == StateType.DSA:
+                    src_indices, dst_indices_local = self._prepare_dsa_state_indices(
+                        src_indices, dst_indices_local
+                    )
+                    if len(src_indices) == 0:
+                        continue
                 if (
                     st == StateType.DSV4_REQUEST_STATE
                     and len(src_indices) == 0
@@ -2908,7 +2914,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self,
         bootstrap_room: int,
         kv_indices: npt.NDArray[np.int32],
-        index_slice: slice,
+        index_slice: Union[slice, npt.NDArray[np.int64]],
         is_last_chunk: bool,
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
