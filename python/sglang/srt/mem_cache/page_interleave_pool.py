@@ -71,6 +71,9 @@ from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicato
 from sglang.srt.distributed.device_communicators.pynccl_wrapper import (
     NCCL_CTA_POLICY_ZERO,
     NCCLLibrary,
+    buffer_type,
+    cudaStream_t,
+    ncclDataTypeEnum,
     ncclWindow_t,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
@@ -82,6 +85,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
     RadixAttention,
+    _set_kv_buffer_impl,
     unwrap_write_loc,
 )
 from sglang.srt.mem_cache.page_interleave import (
@@ -208,7 +212,13 @@ def _view_bytes(
 
 
 class _ScratchSlot:
-    """One half of the double buffer: scratch tensors + ready event.
+    """One half of the double buffer: scratch buffers, their named views, and
+    a ready event.
+
+    ``buffers`` are the allocated tensors, one allgather each per layer;
+    ``tensors`` are the named views the pool packs, stages and reads (the
+    buffers themselves unless a pool splits a buffer's rows into several
+    views, as GQA does with ``[K | V]``).
 
     ``resident_key`` identifies what the slot currently holds — ``(layer_id,
     epoch)`` — so repeated reads of the same layer skip the re-gather and a
@@ -216,19 +226,30 @@ class _ScratchSlot:
     walk.
     """
 
-    def __init__(self, tensors: Dict[str, torch.Tensor], device_module):
+    def __init__(
+        self,
+        buffers: Dict[str, torch.Tensor],
+        tensors: Dict[str, torch.Tensor],
+        device_module,
+    ):
+        self.buffers = buffers
         self.tensors = tensors
         self.ready = device_module.Event()
         self.resident_key: Optional[Tuple[int, int]] = None
+        # Per-batch launch arguments, set by begin_shard_extend: each view's
+        # send block (this rank's rows) and each buffer's ncclAllGather args.
+        self.send_blocks: Dict[str, torch.Tensor] = {}
+        self.all_gather_args: Dict[str, tuple] = {}
 
 
 class PageInterleaveKVPoolMixin:
     """Shard-generic state and mechanics; mixed into concrete pools below.
 
     Subclasses call ``_init_page_shard_state`` after the base pool has created
-    its buffers, and implement ``_scratch_tensor_specs`` (per-slot tensor
-    shapes and dtypes) and ``_gather_pairs`` (pool buffer -> scratch tensor
-    pairs of one layer).
+    its buffers, and implement ``_scratch_tensor_specs`` (per-slot buffer
+    shapes and dtypes) and ``_gather_pairs`` (pool buffer -> scratch view
+    pairs of one layer). A pool that splits a buffer into several views
+    overrides ``_scratch_views`` and ``_scratch_buffer_of``.
     """
 
     # ---- init ---------------------------------------------------------------
@@ -266,16 +287,22 @@ class PageInterleaveKVPoolMixin:
             cta_policy=NCCL_CTA_POLICY_ZERO if self._zero_sm_gather else None,
         )
         self.kv_gather_stream = self.device_module.Stream()
+        self._gather_stream_handle = cudaStream_t(self.kv_gather_stream.cuda_stream)
+        # Orders each gather after the compute stream's prior work; reused
+        # because wait_stream would create and destroy an event per layer.
+        self._gather_order_event = self.device_module.Event()
 
         # Scratch: [prefix | chunk | trash page], double-buffered.
         scratch_rows = spec.scratch_rows
+        self._scratch_rows = scratch_rows
         self._chunk_base = spec.max_prefix_tokens
         self._trash_base = spec.max_prefix_tokens + spec.chunk_tokens
-        slot_tensors, self._scratch_window_registered = self._alloc_scratch(
+        slot_buffers, self._scratch_window_registered = self._alloc_scratch(
             scratch_rows
         )
         self._slots = [
-            _ScratchSlot(tensors, self.device_module) for tensors in slot_tensors
+            _ScratchSlot(buffers, self._scratch_views(buffers), self.device_module)
+            for buffers in slot_buffers
         ]
         with self._torch_alloc_context():
             # Per-batch absolute scratch-page index of every logical page.
@@ -301,11 +328,13 @@ class PageInterleaveKVPoolMixin:
         self._write_plan_key = None
         self._write_plan: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self._translate_cache: Dict[Tuple[int, int], torch.Tensor] = {}
+        # (layer_id, epoch, stream) whose slot that stream already waited on.
+        self._acquired_key: Optional[Tuple[int, int, int]] = None
 
         scratch_bytes = sum(
             tensor.numel() * tensor.element_size()
             for slot in self._slots
-            for tensor in slot.tensors.values()
+            for tensor in slot.buffers.values()
         )
         logger.info(
             "Page-interleave KV sharding enabled: shard_rank=%d shard_size=%d "
@@ -403,12 +432,23 @@ class PageInterleaveKVPoolMixin:
     def _scratch_tensor_specs(self, rows: int) -> Dict[str, _TensorSpec]:
         raise NotImplementedError
 
+    def _scratch_views(
+        self, buffers: Dict[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
+        """Named views of one slot's buffers (by default, the buffers)."""
+        return dict(buffers)
+
+    def _scratch_buffer_of(self, name: str) -> str:
+        """The buffer a scratch view lives in (by default, its namesake)."""
+        return name
+
     def _gather_pairs(self, local_layer: int) -> List[Tuple[torch.Tensor, str]]:
-        """(pool buffer of ``local_layer``, scratch tensor name) pairs."""
+        """(pool buffer of ``local_layer``, scratch view name) pairs."""
         raise NotImplementedError
 
     def _gather_send_rows(self, name: str) -> torch.Tensor:
-        """Source indices in a gather pair's first dimension (tokens by default)."""
+        """Source indices in a view's or buffer's first dimension (tokens by
+        default); a view shares its buffer's first dimension."""
         return self._send_rows
 
     # ---- per-batch plan -------------------------------------------------------
@@ -544,10 +584,39 @@ class PageInterleaveKVPoolMixin:
                 own_local[:, None] * ps
                 + torch.arange(ps, dtype=torch.int64, device=self.device)
             ).reshape(-1)
+            self._plan_slot_gathers()
             self._prefetch_layer(self.start_layer)
         else:
             self._send_pages = None
             self._send_rows = None
+
+    def _plan_slot_gathers(self) -> None:
+        """Cache both slots' per-batch gather arguments, so a layer's gather
+        is the packs plus raw ncclAllGather calls.
+
+        In-place regular allgather: a buffer's send block is exactly this
+        rank's block of the output, and every rank contributes as many rows.
+        """
+        nccl_dtype = ncclDataTypeEnum.from_torch
+        comm = self.kv_gather_comm.comm
+        rank = self.shard_rank
+        for slot in self._slots:
+            slot.send_blocks = {}
+            for name, view in slot.tensors.items():
+                block = self._gather_send_rows(name).numel()
+                slot.send_blocks[name] = view[rank * block : (rank + 1) * block]
+            slot.all_gather_args = {}
+            for name, buf in slot.buffers.items():
+                block = self._gather_send_rows(name).numel()
+                send = buf[rank * block : (rank + 1) * block]
+                slot.all_gather_args[name] = (
+                    buffer_type(send.data_ptr()),
+                    buffer_type(buf.data_ptr()),
+                    send.numel(),
+                    nccl_dtype(buf.dtype),
+                    comm,
+                    self._gather_stream_handle,
+                )
 
     def end_shard_extend(self) -> None:
         """Mark no sharded extend in flight (non-extend forward modes)."""
@@ -584,20 +653,24 @@ class PageInterleaveKVPoolMixin:
         # Order the gather after all prior compute-stream work: the
         # previous tenant's reads (attention of layer_id - 2) and the pool
         # writes that produced the prefix rows.
-        self.kv_gather_stream.wait_stream(self.device_module.current_stream())
+        self._gather_order_event.record(self.device_module.current_stream())
+        self.kv_gather_stream.wait_event(self._gather_order_event)
+        gathered = []
         with self.device_module.stream(self.kv_gather_stream):
             for pool_buf, name in self._gather_pairs(local_layer):
-                send_rows = self._gather_send_rows(name)
-                block = send_rows.numel()
-                scratch = slot.tensors[name]
-                send = scratch[self.shard_rank * block : (self.shard_rank + 1) * block]
-                torch.index_select(pool_buf, 0, send_rows, out=send)
-                # In-place regular allgather: send is exactly the rank's
-                # block of the output, every rank contributes `block` rows.
-                with self.kv_gather_comm.change_state(enable=True):
-                    self.kv_gather_comm.all_gather(
-                        scratch[: self.shard_size * block], send
-                    )
+                torch.index_select(
+                    pool_buf,
+                    0,
+                    self._gather_send_rows(name),
+                    out=slot.send_blocks[name],
+                )
+                buffer_name = self._scratch_buffer_of(name)
+                if buffer_name not in gathered:
+                    gathered.append(buffer_name)
+            # One collective per buffer, after every view of it is packed.
+            nccl = self.kv_gather_comm.nccl
+            for buffer_name in gathered:
+                nccl.ncclAllGather(*slot.all_gather_args[buffer_name])
             slot.ready.record(self.kv_gather_stream)
         slot.resident_key = key
 
@@ -611,13 +684,20 @@ class PageInterleaveKVPoolMixin:
             "(begin_shard_extend not called?)"
         )
         slot = self._slots[layer_id % 2]
-        if self._block_pages:
+        if not self._block_pages:
+            return slot
+        stream = self.device_module.current_stream()
+        acquire_key = (layer_id, self._epoch, stream.cuda_stream)
+        # K and V reads of one layer acquire once: the second read finds its
+        # stream already ordered after the slot and the next gather kicked.
+        if self._acquired_key != acquire_key:
             assert slot.resident_key == (layer_id, self._epoch), (
                 f"prefix scratch miss for layer {layer_id} "
                 f"(resident={slot.resident_key}, epoch={self._epoch})"
             )
-            self.device_module.current_stream().wait_event(slot.ready)
+            stream.wait_event(slot.ready)
             self._prefetch_layer(layer_id + 1)
+            self._acquired_key = acquire_key
         return slot
 
     def _translate_loc_cached(self, loc: torch.Tensor) -> torch.Tensor:
@@ -679,18 +759,48 @@ class PageInterleaveMHATokenToKVPool(PageInterleaveKVPoolMixin, MHATokenToKVPool
         )
         assert not self.post_capture_active
         self._init_page_shard_state(shard_spec, shard_group)
+        # The chunk staging store skips row 0, so no staged row may land there.
+        assert self._chunk_base > 0, "the scratch needs a nonempty prefix region"
+        self._owner_rows_key = None
+        self._owner_rows: Optional[torch.Tensor] = None
 
     def _scratch_tensor_specs(self, rows: int) -> Dict[str, _TensorSpec]:
+        # One [K | V] row per token, so a single allgather moves a layer's K and V.
+        k_dim = self.head_num * self.head_dim
+        v_dim = self.head_num * self.v_head_dim
+        return {"kv": ((rows, k_dim + v_dim), self.store_dtype)}
+
+    def _scratch_views(
+        self, buffers: Dict[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
+        kv = buffers["kv"]
+        rows, k_dim = kv.shape[0], self.head_num * self.head_dim
         return {
-            "k": ((rows, self.head_num, self.head_dim), self.store_dtype),
-            "v": ((rows, self.head_num, self.v_head_dim), self.store_dtype),
+            "k": kv[:, :k_dim].view(rows, self.head_num, self.head_dim),
+            "v": kv[:, k_dim:].view(rows, self.head_num, self.v_head_dim),
         }
+
+    def _scratch_buffer_of(self, name: str) -> str:
+        return "kv"
 
     def _gather_pairs(self, local_layer: int):
         return [
             (self.k_buffer[local_layer], "k"),
             (self.v_buffer[local_layer], "v"),
         ]
+
+    def _get_owner_rows(self, loc: torch.Tensor) -> torch.Tensor:
+        """Local pool row of every token of ``loc``: its own where this rank
+        owns it, else the reserved padding row 0, which the store skips.
+
+        Cached per batch, like ``_get_write_plan``, and sync-free.
+        """
+        key = (loc.data_ptr(), loc.numel(), self._epoch)
+        if self._owner_rows_key != key:
+            owned = self.placement.local_mask(loc, self.shard_rank)
+            self._owner_rows = torch.where(owned, self.placement.local_index(loc), 0)
+            self._owner_rows_key = key
+        return self._owner_rows
 
     def set_kv_buffer(
         self,
@@ -726,18 +836,22 @@ class PageInterleaveMHATokenToKVPool(PageInterleaveKVPoolMixin, MHATokenToKVPool
             # and disjoint from the gather stream, which only writes the
             # prefix region. Padded locations translate to the trash page.
             slot = self._slots[layer_id % 2]
-            rows = self._translate_loc_cached(loc)
-            slot.tensors["k"][rows] = cache_k
-            slot.tensors["v"][rows] = cache_v
-
-        owned_idx, local_rows = self._get_write_plan(loc)
-        if owned_idx.numel() > 0:
-            self._store_kv_layer(
-                layer_id - self.start_layer,
-                local_rows,
-                cache_k.index_select(0, owned_idx),
-                cache_v.index_select(0, owned_idx),
+            _set_kv_buffer_impl(
+                cache_k,
+                cache_v,
+                slot.tensors["k"],
+                slot.tensors["v"],
+                self._translate_loc_cached(loc),
+                row_dim=self.row_dim,
+                store_dtype=self.store_dtype,
+                device_module=self.device_module,
+                size_limit=self._scratch_rows,
+                v_row_dim=self.v_row_dim,
             )
+
+        self._store_kv_layer(
+            layer_id - self.start_layer, self._get_owner_rows(loc), cache_k, cache_v
+        )
 
     def get_key_buffer(self, layer_id: int):
         if self._shard_extend_active:

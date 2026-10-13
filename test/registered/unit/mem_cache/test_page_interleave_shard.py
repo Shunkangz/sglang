@@ -1031,6 +1031,7 @@ def _make_pool_stub(spec, shard_rank=0, debug=True, table_pages=4096):
         PageInterleaveKVPoolMixin.translate_loc_to_scratch(stub, loc)
     )
     stub.prefetched = []
+    stub._plan_slot_gathers = lambda: None
     stub._prefetch_layer = lambda layer_id: stub.prefetched.append(layer_id)
     return stub
 
