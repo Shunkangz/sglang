@@ -1,0 +1,20 @@
+driver API 13040 runtime 13000
+stream priority range: least=0 greatest=-5
+NVIDIA B200 SMs=148 asyncEngineCount=4 concurrentKernels=1 computePreemption=0
+computePreemptionSupported=1
+CAN_USE_STREAM_WAIT_VALUE_NOR=1
+CAN_USE_64_BIT_STREAM_MEM_OPS=1
+CAN_FLUSH_REMOTE_WRITES=0
+canAccessPeer(1->0)=1
+enqueue wait on GPU0 local flag (EQ 7) then write out0=1
+  ok: cuStreamWaitValue32((CUstream)s0, (CUdeviceptr)flag0, 7, CU_STREAM_WAIT_VALUE_EQ)
+  ok: cuStreamWriteValue32((CUstream)s0, (CUdeviceptr)out0, 1, 0)
+GPU1 stream writes 7 into GPU0's flag (peer address)
+  ok: cuStreamWriteValue32((CUstream)s1, (CUdeviceptr)flag0, 7, 0)
+peer write released local wait: out0=1 (expect 1)
+GPU0 stream waits on a flag in GPU1 memory
+  ok: cuStreamWaitValue32((CUstream)s0, (CUdeviceptr)flag1, 3, CU_STREAM_WAIT_VALUE_GEQ)
+  ok: cuStreamWriteValue32((CUstream)s0, (CUdeviceptr)out0, 2, 0)
+  ok: cuStreamWriteValue32((CUstream)s1, (CUdeviceptr)flag1, 3, 0)
+wait on peer address: out0=2 (expect 2)
+done

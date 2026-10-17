@@ -1,0 +1,11 @@
+memSyncDomainCount=4
+DOMAIN {"bg_ctas":0,"bg_domain":"default","fence_domain":"default","fence_sys_us":1.461,"remote_store_fence_sys_us":1.578}
+DOMAIN {"bg_ctas":0,"bg_domain":"default","fence_domain":"remote","fence_sys_us":1.461,"remote_store_fence_sys_us":1.578}
+DOMAIN {"bg_ctas":2,"bg_domain":"default","fence_domain":"default","fence_sys_us":2.159,"remote_store_fence_sys_us":2.165}
+DOMAIN {"bg_ctas":2,"bg_domain":"default","fence_domain":"remote","fence_sys_us":2.156,"remote_store_fence_sys_us":2.167}
+DOMAIN {"bg_ctas":2,"bg_domain":"remote","fence_domain":"default","fence_sys_us":2.159,"remote_store_fence_sys_us":2.162}
+DOMAIN {"bg_ctas":2,"bg_domain":"remote","fence_domain":"remote","fence_sys_us":2.152,"remote_store_fence_sys_us":2.168}
+DOMAIN {"bg_ctas":8,"bg_domain":"default","fence_domain":"default","fence_sys_us":2.302,"remote_store_fence_sys_us":2.309}
+DOMAIN {"bg_ctas":8,"bg_domain":"default","fence_domain":"remote","fence_sys_us":2.303,"remote_store_fence_sys_us":2.309}
+DOMAIN {"bg_ctas":8,"bg_domain":"remote","fence_domain":"default","fence_sys_us":2.302,"remote_store_fence_sys_us":2.308}
+DOMAIN {"bg_ctas":8,"bg_domain":"remote","fence_domain":"remote","fence_sys_us":2.304,"remote_store_fence_sys_us":2.309}

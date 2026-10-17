@@ -1,0 +1,18 @@
+RESULT {"bg":"none","bg_GBps_per_gpu":0.0,"flag_rtt_us":5.419,"remote_load_us":1.539,"fence_sys_us":1.461,"fence_gpu_us":0.168,"remote_store_fence_sys_us":1.578,"local_store_fence_sys_us":1.461}
+RESULT {"bg":"sm x1","bg_GBps_per_gpu":43.9,"flag_rtt_us":6.709,"remote_load_us":1.727,"fence_sys_us":2.008,"fence_gpu_us":0.167,"remote_store_fence_sys_us":2.017,"local_store_fence_sys_us":2.008}
+RESULT {"bg":"sm x2","bg_GBps_per_gpu":87.3,"flag_rtt_us":6.911,"remote_load_us":1.749,"fence_sys_us":2.158,"fence_gpu_us":0.168,"remote_store_fence_sys_us":2.161,"local_store_fence_sys_us":2.156}
+RESULT {"bg":"sm x4","bg_GBps_per_gpu":174.0,"flag_rtt_us":7.149,"remote_load_us":1.824,"fence_sys_us":2.240,"fence_gpu_us":0.167,"remote_store_fence_sys_us":2.246,"local_store_fence_sys_us":2.239}
+RESULT {"bg":"sm x8","bg_GBps_per_gpu":347.8,"flag_rtt_us":6.595,"remote_load_us":1.893,"fence_sys_us":2.301,"fence_gpu_us":0.168,"remote_store_fence_sys_us":2.311,"local_store_fence_sys_us":2.301}
+RESULT {"bg":"sm x16","bg_GBps_per_gpu":679.1,"flag_rtt_us":10.811,"remote_load_us":2.347,"fence_sys_us":4.154,"fence_gpu_us":0.168,"remote_store_fence_sys_us":4.135,"local_store_fence_sys_us":4.160}
+warning: CE background ended before the probes (80.3 ms)
+warning: CE background ended before the probes (79.7 ms)
+warning: CE background ended before the probes (79.6 ms)
+warning: CE background ended before the probes (80.3 ms)
+warning: CE background ended before the probes (80.6 ms)
+RESULT {"bg":"ce 4MiB","bg_GBps_per_gpu":438.7,"flag_rtt_us":5.427,"remote_load_us":1.711,"fence_sys_us":1.461,"fence_gpu_us":0.167,"remote_store_fence_sys_us":1.578,"local_store_fence_sys_us":1.461}
+RESULT {"bg":"bystander sm x2","bg_GBps_per_gpu":86.9,"flag_rtt_us":5.419,"remote_load_us":1.540,"fence_sys_us":1.461,"fence_gpu_us":0.167,"remote_store_fence_sys_us":1.578,"local_store_fence_sys_us":1.461}
+RESULT {"bg":"bystander sm x8","bg_GBps_per_gpu":343.5,"flag_rtt_us":5.415,"remote_load_us":1.540,"fence_sys_us":1.461,"fence_gpu_us":0.167,"remote_store_fence_sys_us":1.578,"local_store_fence_sys_us":1.461}
+RESULT {"bg":"bystander sm x16","bg_GBps_per_gpu":673.6,"flag_rtt_us":5.424,"remote_load_us":1.540,"fence_sys_us":1.461,"fence_gpu_us":0.168,"remote_store_fence_sys_us":1.578,"local_store_fence_sys_us":1.461}
+RESULT {"bg":"into GPU0 sm x4","bg_GBps_per_gpu":173.0,"flag_rtt_us":6.349,"remote_load_us":1.799,"fence_sys_us":1.461,"fence_gpu_us":0.168,"remote_store_fence_sys_us":1.651,"local_store_fence_sys_us":1.461}
+RESULT {"bg":"from GPU0 only sm x4","bg_GBps_per_gpu":174.5,"flag_rtt_us":6.087,"remote_load_us":1.722,"fence_sys_us":2.125,"fence_gpu_us":0.167,"remote_store_fence_sys_us":2.135,"local_store_fence_sys_us":2.126}
+RESULT {"bg":"from GPU0 only sm x16","bg_GBps_per_gpu":684.0,"flag_rtt_us":7.743,"remote_load_us":2.016,"fence_sys_us":3.256,"fence_gpu_us":0.168,"remote_store_fence_sys_us":3.265,"local_store_fence_sys_us":3.265}

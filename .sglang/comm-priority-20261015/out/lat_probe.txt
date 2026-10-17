@@ -1,0 +1,15 @@
+RESULT {"bg":"none","bg_GBps_per_gpu":0.0,"flag_rtt_us":5.470,"remote_load_us":1.537}
+RESULT {"bg":"sm x1","bg_GBps_per_gpu":43.9,"flag_rtt_us":6.751,"remote_load_us":1.724}
+RESULT {"bg":"sm x2","bg_GBps_per_gpu":87.6,"flag_rtt_us":6.920,"remote_load_us":1.749}
+RESULT {"bg":"sm x4","bg_GBps_per_gpu":174.2,"flag_rtt_us":7.161,"remote_load_us":1.823}
+RESULT {"bg":"sm x8","bg_GBps_per_gpu":347.8,"flag_rtt_us":6.634,"remote_load_us":1.891}
+RESULT {"bg":"sm x16","bg_GBps_per_gpu":677.3,"flag_rtt_us":10.830,"remote_load_us":2.343}
+warning: CE background ended before the probes (79.9 ms)
+warning: CE background ended before the probes (80.7 ms)
+warning: CE background ended before the probes (81.0 ms)
+warning: CE background ended before the probes (80.1 ms)
+warning: CE background ended before the probes (80.8 ms)
+RESULT {"bg":"ce 4MiB","bg_GBps_per_gpu":436.4,"flag_rtt_us":5.562,"remote_load_us":1.708}
+RESULT {"bg":"bystander sm x2","bg_GBps_per_gpu":86.6,"flag_rtt_us":5.525,"remote_load_us":1.537}
+RESULT {"bg":"bystander sm x8","bg_GBps_per_gpu":343.5,"flag_rtt_us":5.501,"remote_load_us":1.537}
+RESULT {"bg":"bystander sm x16","bg_GBps_per_gpu":672.9,"flag_rtt_us":5.505,"remote_load_us":1.538}
