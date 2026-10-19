@@ -144,6 +144,10 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
         gate (see available_size)."""
         return self.page_size * sum(self.class_free_page_counts())
 
+    def capacity_size(self) -> int:
+        """Logical slots of an empty pool: every class's allocatable pages."""
+        return self.shard_size * self.page_size * (self.num_pages // self.shard_size)
+
     def least_full_class(self) -> int:
         """Rotation base for a new chain: the class with the most free pages,
         ties broken by the lowest class id. A pure function of the mirrored

@@ -1,10 +1,12 @@
 import unittest
+from array import array
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
 
 import sglang.srt.managers.schedule_policy as schedule_policy
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
@@ -20,21 +22,27 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
     IncLockRefResult,
+    InsertParams,
+    MatchPrefixParams,
     TreeLock,
 )
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.page_interleave import PageShardSpec, make_page_shard_spec
 from sglang.srt.mem_cache.prefill_budget import (
     PrefillBudget,
     SWAPrefillBudget,
     estimate_swa_kv_tokens,
 )
-from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, enter_scope
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -1948,6 +1956,180 @@ class TestPrefillAdder(CustomTestCase):
                 size_swa=4096, sliding_window=128
             ).memory_budget.swa_never_fits(**req)
         )
+
+
+class TestShardedIdleSkewReclaim(CustomTestCase):
+    """An idle sharded prefill admits a request the empty pool fits, even when
+    its cached pages are skewed across owner classes."""
+
+    SHARDS, PS, PAGES_PER_RANK = 2, 16, 16
+    CAPACITY = SHARDS * PS * PAGES_PER_RANK
+    # Cold admission needs prompt + 1 new token + one page per shard < capacity.
+    LONGEST = CAPACITY - SHARDS * PS - 2
+
+    def setUp(self):
+        super().setUp()
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+        enter_scope(
+            self, envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("python")
+        )
+        self._build_pool()
+
+    def _build_pool(self):
+        self.allocator = PageInterleavePoolAllocator(
+            size=self.PAGES_PER_RANK * self.PS,
+            physical_page_size=self.PS,
+            shard_size=self.SHARDS,
+            dtype=torch.int64,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+            shard_spec=PageShardSpec(
+                shard_rank=0,
+                shard_size=self.SHARDS,
+                page_size=self.PS,
+                max_prefix_tokens=self.CAPACITY,
+                chunk_tokens=self.CAPACITY,
+            ),
+        )
+        self.tree = UnifiedRadixCache(
+            CacheInitParams(
+                disable=False,
+                req_to_token_pool=ReqToTokenPool(
+                    size=4,
+                    max_context_len=self.CAPACITY + self.PS,
+                    device="cpu",
+                    enable_memory_saver=False,
+                ),
+                token_to_kv_pool_allocator=self.allocator,
+                page_size=self.PS,
+                eviction_policy="lru",
+                tree_components=(ComponentType.FULL,),
+            )
+        )
+
+    def _alloc_chain(self, n_pages, base):
+        """Pages of one chain; page P is owned by class (base + P) % SHARDS."""
+        n = n_pages * self.PS
+        return self.allocator.alloc_extend(
+            prefix_lens=torch.tensor([0]),
+            prefix_lens_cpu=torch.tensor([0]),
+            seq_lens=torch.tensor([n]),
+            seq_lens_cpu=torch.tensor([n]),
+            last_loc=torch.tensor([-1]),
+            extend_num_tokens=n,
+            rotation_bases=[base],
+        ).to(torch.int64)
+
+    def _cache(self, tokens, base):
+        self.tree.insert(
+            InsertParams(
+                key=RadixKey(array("q", tokens)),
+                value=self._alloc_chain(len(tokens) // self.PS, base=base),
+                rotation_base=base,
+            )
+        )
+
+    def _cached_len(self, tokens):
+        match = self.tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)))
+        )
+        return match.device_prefix_len
+
+    def _req(self, rid, tokens):
+        req = Req(
+            rid=rid,
+            origin_input_text="",
+            origin_input_ids=array("q", tokens),
+            sampling_params=SamplingParams(max_new_tokens=1),
+        )
+        req.init_next_round_input(self.tree)
+        return req
+
+    def _adder(self, running=()):
+        return PrefillAdder(
+            page_size=self.PS,
+            tree_cache=self.tree,
+            token_to_kv_pool_allocator=self.allocator,
+            running_batch=SimpleNamespace(
+                reqs=list(running), batch_size=lambda: len(running)
+            ),
+            new_token_ratio=1.0,
+            rem_input_tokens=self.CAPACITY,
+            rem_chunk_tokens=self.CAPACITY,
+        )
+
+    def _admit(self, req, *, adder=None):
+        adder = adder or self._adder()
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+        return req in adder.can_run_list, result
+
+    def test_cache_skewed_to_one_class_is_evicted(self):
+        other = list(range(10_000, 10_000 + self.PS))
+        self._cache(other, base=0)
+        req = self._req("head", list(range(self.LONGEST)))
+
+        self.assertTrue(self._admit(req)[0])
+        self.assertEqual(self._cached_len(other), 0)
+
+    def test_own_skewed_prefix_is_evicted_and_recomputed(self):
+        tokens = list(range(self.LONGEST))
+        self._cache(tokens[: self.PS], base=0)
+        req = self._req("head", tokens)
+        self.assertEqual(req.prefix_len, self.PS)
+
+        self.assertTrue(self._admit(req)[0])
+        self.assertEqual(req.prefix_len, 0)
+
+    def test_own_prefix_survives_when_other_cache_admits_it(self):
+        # Eight class-0 pages fill class 0 together with the own prefix's eight.
+        others = [
+            list(range(10_000 + 100 * i, 10_000 + 100 * i + self.PS)) for i in range(8)
+        ]
+        for other in others:
+            self._cache(other, base=0)
+        tokens = list(range(400))
+        self._cache(tokens[:256], base=0)
+        req = self._req("head", tokens)
+
+        self.assertTrue(self._admit(req)[0])
+        self.assertEqual(req.prefix_len, 256)
+        self.assertLess(sum(self._cached_len(o) for o in others), 8 * self.PS)
+
+    def test_reclaim_only_unblocks_an_idle_pool(self):
+        other = list(range(10_000, 10_000 + self.PS))
+        running_req = SimpleNamespace(
+            sampling_params=SimpleNamespace(max_new_tokens=0, ignore_eos=False),
+            output_ids=[],
+        )
+        cases = {
+            # In-flight KV outside the tree is freed without eviction.
+            "in_flight": dict(prompt_len=self.LONGEST - 2 * self.PS, in_flight=True),
+            # Admission refuses it on an empty pool too.
+            "too_long": dict(prompt_len=self.LONGEST + 1),
+            # The batch admitted earlier in this pass runs first.
+            "admitted_work": dict(prompt_len=self.LONGEST - 4 * self.PS, small=True),
+            # Running requests free their KV without eviction.
+            "running": dict(prompt_len=self.LONGEST, running=(running_req,)),
+        }
+        for name, case in cases.items():
+            with self.subTest(name):
+                self._build_pool()
+                self._cache(other, base=0)
+                if case.get("in_flight"):
+                    self._alloc_chain(1, base=0)
+                adder = self._adder(running=case.get("running", ()))
+                if case.get("small"):
+                    small = self._req("small", list(range(20_000, 20_000 + self.PS)))
+                    self.assertTrue(self._admit(small, adder=adder)[0])
+                req = self._req("head", list(range(case["prompt_len"])))
+
+                self.assertEqual(
+                    self._admit(req, adder=adder), (False, AddReqResult.NO_TOKEN)
+                )
+                self.assertEqual(self._cached_len(other), self.PS)
 
 
 if __name__ == "__main__":

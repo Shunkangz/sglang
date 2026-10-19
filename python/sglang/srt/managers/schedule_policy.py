@@ -1351,6 +1351,51 @@ class PrefillAdder:
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
+        kwargs = dict(
+            has_chunked_req=has_chunked_req,
+            truncation_align_size=truncation_align_size,
+        )
+        result = self._add_one_req(req, **kwargs)
+        if result is AddReqResult.NO_TOKEN and self._reclaim_kv_shard_skew(req):
+            # The evicted cache may have held part of this request's own prefix.
+            req.init_next_round_input(self.tree_cache)
+            result = self._add_one_req(req, **kwargs)
+        return result
+
+    def _reclaim_kv_shard_skew(self, req: Req) -> bool:
+        if self.kv_shard_size <= 1 or self.can_run_list:
+            return False
+        if self.running_batch is not None and self.running_batch.reqs:
+            return False
+        allocator = self.token_to_kv_pool_allocator
+        capacity = allocator.capacity_size()
+        # Pages held outside the cache (in-flight KV) free up without eviction.
+        held = capacity - allocator.aggregate_free_size()
+        if held != self.tree_cache.evictable_size():
+            return False
+        cold_need = (
+            len(req.full_untruncated_fill_ids)
+            + self._swa_new_tokens(req)
+            + self.per_req_token_overhead
+            + self._request_slot_reserve_for_req(req)
+            + self.memory_budget.total_offset
+            + 1
+        )
+        warm_need = cold_need - req.prefix_len
+        if allocator.available_size() >= warm_need or cold_need > capacity:
+            return False
+        # The budget credits free pages per class but evictable cache only in
+        # aggregate, so cache skewed across classes can stall an idle queue head.
+        with self._lock_node(req.last_node):
+            allocator.evict_to_free_tokens(self.tree_cache, warm_need)
+        if allocator.available_size() >= warm_need:
+            return True
+        allocator.evict_to_free_tokens(self.tree_cache, cold_need)
+        return allocator.available_size() >= cold_need
+
+    def _add_one_req(
+        self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
+    ):
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
             return AddReqResult.OTHER
 
