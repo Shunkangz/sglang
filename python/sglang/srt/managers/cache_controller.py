@@ -37,10 +37,12 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
     from sglang.srt.mem_cache.pool_host import HostKVCache
 
+from sglang.srt.arg_groups.hicache_hook import UNIFIED_KEY_SCHEME_STORAGE_BACKENDS
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.mem_cache.hicache_key_scheme import (
+    UnifiedKVPlan,
     namespace_digest,
     normalize_dtype,
     plan_unified_kv,
@@ -559,9 +561,14 @@ class HiCacheController:
                 "The page_unified host layout requires unified storage keys "
                 "to distinguish its byte order."
             )
-        if key_scheme == "unified" and storage_backend != "file":
+        if (
+            key_scheme == "unified"
+            and storage_backend not in UNIFIED_KEY_SCHEME_STORAGE_BACKENDS
+        ):
             raise NotImplementedError(
-                "The unified key scheme supports only the file storage backend."
+                f"The unified key scheme supports the "
+                f"{', '.join(UNIFIED_KEY_SCHEME_STORAGE_BACKENDS)} storage "
+                f"backends; got {storage_backend!r}."
             )
 
         # Defensive: a previous partial detach may have flipped `enable_storage` but
@@ -769,7 +776,7 @@ class HiCacheController:
 
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
         model_name = storage_model_name(model_name, self.storage_host_pool)
-        unified_suffixes = self._build_unified_suffixes(model_name, attn_cp_size)
+        unified_plan = self._build_unified_plan(model_name, attn_cp_size)
 
         return HiCacheStorageConfig(
             tp_rank=tp_rank,
@@ -787,13 +794,20 @@ class HiCacheController:
             should_split_heads=should_split_heads,
             dp_rank=dp_rank,
             extra_config=storage_backend_extra_config,
-            unified_suffixes=unified_suffixes,
+            unified_suffixes=(
+                unified_plan.suffixes if unified_plan is not None else None
+            ),
+            unified_chunk_spans=(
+                unified_plan.chunk_spans(self.storage_host_pool.page_unified_layout)
+                if unified_plan is not None
+                else None
+            ),
         )
 
-    def _build_unified_suffixes(
+    def _build_unified_plan(
         self, model_name: Optional[str], attn_cp_size: int
-    ) -> Optional[List[str]]:
-        """This rank's topology-free chunk coordinates, or None for rank-suffix keys."""
+    ) -> Optional[UnifiedKVPlan]:
+        """This rank's topology-free chunk plan, or None for rank-suffix keys."""
         memory = get_memory()
         if memory.hicache_storage_key_scheme != "unified":
             return None
@@ -855,7 +869,7 @@ class HiCacheController:
             namespace_digest(plan.namespace),
             plan.suffixes,
         )
-        return plan.suffixes
+        return plan
 
     def reset(self):
         # Reuse detach's queue wakeups and bounded joins, and fail if any

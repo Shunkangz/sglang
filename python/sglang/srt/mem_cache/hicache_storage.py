@@ -8,7 +8,7 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, List, Optional, Set
+from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple
 
 import torch
 
@@ -44,6 +44,9 @@ class HiCacheStorageConfig:
     # layer-major / head-minor. When set, backends MUST key objects by these
     # instead of by the writer's rank.
     unified_suffixes: Optional[List[str]] = None
+    # Byte (offset, length) of each unified suffix's chunk in one host page
+    # block, paired by position; a chunk is one run at block address + offset.
+    unified_chunk_spans: Optional[List[Tuple[int, int]]] = None
 
 
 @dataclass

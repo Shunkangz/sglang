@@ -96,9 +96,18 @@ class TestUnifiedKeySchemeArgs(CustomTestCase):
     def test_unified_needs_a_supported_storage_backend(self):
         with self.assertRaisesRegex(ValueError, "needs"):
             _resolve(hicache_storage_backend=None)
-        for backend in ("hf3fs", "mooncake"):
+        for backend in ("hf3fs", "nixl"):
             with self.subTest(backend=backend), self.assertRaises(NotImplementedError):
                 _resolve(hicache_storage_backend=backend)
+
+    def test_unified_accepts_the_mooncake_backend(self):
+        args = _resolve(
+            hicache_storage_backend="mooncake",
+            hicache_storage_head_partition=2,
+            hicache_storage_layer_partition=8,
+        )
+        self.assertEqual(resolution_result(args, "hicache_mem_layout"), "page_unified")
+        self.assertEqual(resolution_result(args, "hicache_io_backend"), "kernel")
 
     def test_unified_refuses_speculative_decoding(self):
         # Draft layers sit on the host pool's layer axis but outside the grid.
@@ -122,7 +131,7 @@ class TestUnifiedKeySchemeArgs(CustomTestCase):
 
 
 class TestControllerUnifiedKeys(CustomTestCase):
-    def _controller(self, *, mla=False, grouped=True):
+    def _controller(self, *, mla=False, grouped=True, head_group_num=1):
         device_pool = object.__new__(MLATokenToKVPool) if mla else SimpleNamespace()
         # FP8 variants share a uint8 storage view but require distinct keys.
         device_pool.dtype = torch.float8_e4m3fn
@@ -131,7 +140,7 @@ class TestControllerUnifiedKeys(CustomTestCase):
         host_pool = SimpleNamespace(
             dtype=torch.uint8,
             head_num=0 if mla else 4,
-            head_group_num=1,
+            head_group_num=head_group_num,
             start_layer=4,
             end_layer=8,
             layer_num=4,
@@ -139,7 +148,7 @@ class TestControllerUnifiedKeys(CustomTestCase):
                 page_size=16,
                 layer_num=4,
                 head_num=1 if mla else 4,
-                head_group_num=1,
+                head_group_num=head_group_num,
                 head_dim=128,
                 itemsize=1,
                 is_mla=mla,
@@ -160,11 +169,11 @@ class TestControllerUnifiedKeys(CustomTestCase):
             controller.mem_pool_device = device_pool
         return controller
 
-    def _suffixes(self, controller, *, attn_cp_size=1):
+    def _plan(self, controller, *, attn_cp_size=1, head_partition=4, layer_partition=4):
         memory = SimpleNamespace(
             hicache_storage_key_scheme="unified",
-            hicache_storage_head_partition=4,
-            hicache_storage_layer_partition=4,
+            hicache_storage_head_partition=head_partition,
+            hicache_storage_layer_partition=layer_partition,
         )
         parallel = SimpleNamespace(
             tp_rank=5,
@@ -183,9 +192,12 @@ class TestControllerUnifiedKeys(CustomTestCase):
                 return_value=parallel,
             ),
         ):
-            return controller._build_unified_suffixes(
+            return controller._build_unified_plan(
                 "org/model", attn_cp_size=attn_cp_size
             )
+
+    def _suffixes(self, controller, *, attn_cp_size=1):
+        return self._plan(controller, attn_cp_size=attn_cp_size).suffixes
 
     def test_anchor_dtype_and_attention_topology_define_mha_keys(self):
         namespace = derive_namespace(
@@ -332,14 +344,85 @@ class TestControllerUnifiedKeys(CustomTestCase):
                 return_value=True,
             ),
             patch.object(controller, "get_attn_cp_rank_and_size", return_value=(1, 2)),
-            patch.object(
-                controller, "_build_unified_suffixes", return_value=["shared"]
-            ),
+            patch.object(controller, "_build_unified_plan", return_value=None),
         ):
             config = controller._generate_storage_config("org/model")
         self.assertEqual((config.tp_rank, config.tp_size, config.dp_rank), (0, 2, 1))
         self.assertEqual((config.attn_cp_rank, config.attn_cp_size), (1, 2))
         self.assertTrue(config.is_mla_model)
+
+    def test_storage_config_pairs_each_suffix_with_its_chunk_span(self):
+        """Per-chunk backends zip the two lists, so pairing is the contract.
+
+        Rank 1 of attn-TP2 owns global head groups 2 and 3 of a 2-group pool;
+        each (layer range, group) chunk is one run inside the page block.
+        """
+        controller = self._controller(head_group_num=2)
+        plan = self._plan(controller, head_partition=2, layer_partition=2)
+        controller.mem_pool_host.layout = "page_unified"
+        controller.storage_host_pool.storage_format_tag = None
+        controller.enable_storage_metrics = False
+        parallel = SimpleNamespace(
+            tp_rank=1,
+            tp_size=2,
+            attn_tp_rank=1,
+            attn_tp_size=2,
+            pp_rank=1,
+            pp_size=2,
+        )
+        with (
+            patch(
+                "sglang.srt.managers.cache_controller.get_parallel",
+                return_value=parallel,
+            ),
+            patch(
+                "sglang.srt.managers.cache_controller.is_dp_attention_enabled",
+                return_value=False,
+            ),
+            patch.object(controller, "get_attn_cp_rank_and_size", return_value=(0, 1)),
+            patch.object(controller, "_build_unified_plan", return_value=plan),
+        ):
+            config = controller._generate_storage_config("org/model")
+
+        layout = controller.storage_host_pool.page_unified_layout
+        chunk = 2 * layout.layer_bytes
+        self.assertEqual(config.unified_suffixes, plan.suffixes)
+        self.assertEqual(
+            {
+                suffix.split("_", 1)[1]: span
+                for suffix, span in zip(
+                    config.unified_suffixes, config.unified_chunk_spans
+                )
+            },
+            {
+                "L4-6_H2": (0, chunk),
+                "L4-6_H3": (layout.head_group_bytes, chunk),
+                "L6-8_H2": (chunk, chunk),
+                "L6-8_H3": (layout.head_group_bytes + chunk, chunk),
+            },
+        )
+
+    def test_rank_suffix_config_has_no_chunk_spans(self):
+        controller = self._controller()
+        controller.mem_pool_host.layout = "page_first"
+        controller.storage_host_pool.storage_format_tag = None
+        controller.enable_storage_metrics = False
+        parallel = SimpleNamespace(tp_rank=0, tp_size=1, pp_rank=0, pp_size=1)
+        with (
+            patch(
+                "sglang.srt.managers.cache_controller.get_parallel",
+                return_value=parallel,
+            ),
+            patch(
+                "sglang.srt.managers.cache_controller.is_dp_attention_enabled",
+                return_value=False,
+            ),
+            patch.object(controller, "get_attn_cp_rank_and_size", return_value=(0, 1)),
+            patch.object(controller, "_build_unified_plan", return_value=None),
+        ):
+            config = controller._generate_storage_config("org/model")
+        self.assertIsNone(config.unified_suffixes)
+        self.assertIsNone(config.unified_chunk_spans)
 
     def test_hybrid_write_back_preserves_cpu_host_indices(self):
         controller = object.__new__(HybridCacheController)
