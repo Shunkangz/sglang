@@ -21,6 +21,7 @@ from sglang.srt.layers.attention.qsa.config import (
     is_qwen_qsa,
     parse_qsa_profile,
 )
+from sglang.srt.layers.attention.qsa.cp_all_gather import qsa_cp_zero_sm_all_gather
 from sglang.srt.layers.attention.qsa.fused_kv import fused_kv_prepare
 from sglang.srt.layers.attention.qsa.kernel import (
     expand_qsa_block_indices,
@@ -135,7 +136,12 @@ def _gather_cp_kv(
     k_width = k.shape[1] * k.shape[2]
     v_width = v.shape[1] * v.shape[2]
     kv_local = torch.cat([k.flatten(1), v.flatten(1)], dim=-1)
-    kv_full = cp_materialize_global_token_order(kv_local, forward_batch)
+    # On copy engines the gather takes no SMs from the indexer it overlaps.
+    kv_full = cp_materialize_global_token_order(
+        kv_local,
+        forward_batch,
+        all_gather=qsa_cp_zero_sm_all_gather(kv_local, forward_batch, "kv"),
+    )
     k_full, v_full = kv_full.split([k_width, v_width], dim=-1)
     k_full = k_full.reshape(-1, k.shape[1], k.shape[2]).contiguous()
     v_full = v_full.reshape(-1, v.shape[1], v.shape[2]).contiguous()

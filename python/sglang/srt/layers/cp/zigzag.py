@@ -324,9 +324,9 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         )
 
     def gather_kv_cache(
-        self, x: Any, forward_batch, stream: Optional[Any] = None
+        self, x: Any, forward_batch, stream: Optional[Any] = None, all_gather=None
     ) -> Any:
-        gathered = self._all_gather_reorganized(x, forward_batch)
+        gathered = self._all_gather_reorganized(x, forward_batch, all_gather)
         chunks = torch.split(
             gathered, forward_batch.attn_cp_metadata.reverse_split_len, dim=0
         )
@@ -457,7 +457,7 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             latent_full[..., kv_lora_rank:],
         )
 
-    def _all_gather_reorganized(self, x: torch.Tensor, forward_batch):
+    def _all_gather_reorganized(self, x: torch.Tensor, forward_batch, all_gather=None):
         meta = forward_batch.attn_cp_metadata
         per_rank_token = meta.per_rank_logical_token or meta.per_rank_actual_token
         max_len = max(per_rank_token)
@@ -466,7 +466,18 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         else:
             local_len = per_rank_token[self.cp_rank]
         assert x.shape[0] >= local_len
-        x = x[:local_len]
+        gathered = (all_gather or self._all_gather_padded)(x[:local_len], max_len)
+
+        chunks = torch.split(gathered, [max_len] * self.cp_size, dim=0)
+        return torch.cat(
+            [
+                chunks[rank][:per_rank_len]
+                for rank, per_rank_len in enumerate(per_rank_token)
+            ],
+            dim=0,
+        )
+
+    def _all_gather_padded(self, x: torch.Tensor, max_len: int) -> torch.Tensor:
         pad_size = max_len - x.shape[0]
         if pad_size > 0:
             padding = [0, 0] * (x.ndim - 1) + [0, pad_size]
@@ -486,12 +497,4 @@ class ZigzagCPStrategy(ContextParallelStrategy):
                 dtype=x.dtype,
             )
         group.all_gather_into_tensor(gathered, x)
-
-        chunks = torch.split(gathered, [max_len] * self.cp_size, dim=0)
-        return torch.cat(
-            [
-                chunks[rank][:per_rank_len]
-                for rank, per_rank_len in enumerate(per_rank_token)
-            ],
-            dim=0,
-        )
+        return gathered

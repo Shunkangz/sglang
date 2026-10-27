@@ -2148,7 +2148,7 @@ def test_qsa_cp_extend_reads_cached_prefix_in_place(
     monkeypatch.setattr(
         qsa_backend_module,
         "cp_materialize_global_token_order",
-        lambda local, forward_batch: full_kv,
+        lambda local, forward_batch, all_gather: full_kv,
     )
     q = torch.randn(num_local, 4, 64, device="cuda", dtype=torch.bfloat16)
     indices = _qsa_selection(positions.cpu())

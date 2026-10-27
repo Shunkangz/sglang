@@ -150,8 +150,14 @@ class ContextParallelStrategy(ABC):
         x: Any,
         forward_batch: ForwardBatch,
         stream: Optional[Any] = None,
+        all_gather: Optional[Callable[[Any, int], Any]] = None,
     ) -> Any:
-        """Gather rank-local KV payloads back to full token order."""
+        """Gather rank-local KV payloads back to full token order.
+
+        ``all_gather(rows, rows_per_rank)``, when given, replaces the CP
+        group's all-gather: it returns every rank's rows rank-major, one
+        ``rows_per_rank`` block per rank (rows past a rank's own are unused).
+        """
 
     def local_q_indices(self, num_tokens: int, forward_batch: ForwardBatch) -> Any:
         raise NotImplementedError(

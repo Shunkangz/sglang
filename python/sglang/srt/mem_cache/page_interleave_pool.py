@@ -74,9 +74,10 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.distributed.device_communicators.pynccl_wrapper import (
     NCCL_CTA_POLICY_ZERO,
-    NCCLLibrary,
 )
-from sglang.srt.distributed.parallel_state import in_the_same_node_as
+from sglang.srt.distributed.device_communicators.zero_sm_all_gather import (
+    zero_sm_all_gather_supported,
+)
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache import page_interleave
 from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
@@ -89,7 +90,7 @@ from sglang.srt.mem_cache.memory_pool import (
     unwrap_write_loc,
 )
 from sglang.srt.mem_cache.utils import get_mla_kv_buffer_triton
-from sglang.srt.utils import ceil_div, get_bool_env_var, is_cuda
+from sglang.srt.utils import ceil_div, get_bool_env_var
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
@@ -105,10 +106,6 @@ _NUM_SCRATCH_SLOTS = 2
 # NCCL_WIN_REQUIRED_ALIGNMENT in nccl.h. NCCL checks it only at the window
 # base; starting every slot tensor on it is a conservative choice.
 _SCRATCH_ALIGN_BYTES = 4096
-# NCCL 2.31.2 fixes internal CE synchronization buffer initialization and the
-# two-rank multicast-team setup race (upstream commit 430afbc). Zeroing our
-# scratch cannot initialize NCCL's internal buffers.
-_NCCL_SYMMETRIC_SCRATCH_MIN_VERSION = 23102
 
 
 def _symmetric_scratch_supported(
@@ -121,13 +118,9 @@ def _symmetric_scratch_supported(
         not envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.get()
         or memory_saver_enabled
         or custom_mem_pool is not None
-        or not is_cuda()
-        or NCCLLibrary().ncclGetRawVersion() < _NCCL_SYMMETRIC_SCRATCH_MIN_VERSION
     ):
         return False
-    # Across nodes NCCL would run the windowed allgather on its hierarchical
-    # path (inter-node RMA proxy puts); only the in-node CE path is verified.
-    return all(in_the_same_node_as(shard_group.cpu_group, source_rank=0))
+    return zero_sm_all_gather_supported(shard_group)
 
 
 def _symmetric_scratch_layout(

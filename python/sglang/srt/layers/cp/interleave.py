@@ -271,8 +271,10 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         return self._gather_interleaved_tensor(x, forward_batch)
 
     def gather_kv_cache(
-        self, x: Any, forward_batch, stream: Optional[Any] = None
+        self, x: Any, forward_batch, stream: Optional[Any] = None, all_gather=None
     ) -> Any:
+        if all_gather is not None:
+            raise NotImplementedError(f"{self.name} CP gathers over its CP group.")
         return self._gather_interleaved_tensor(x, forward_batch)
 
     def _gather_interleaved_tensor(self, x: Any, forward_batch) -> Any:

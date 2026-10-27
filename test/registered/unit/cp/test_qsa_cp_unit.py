@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from sglang.srt.layers.attention import qwen_sparse_attn_backend
-from sglang.srt.layers.attention.qsa import qsa_indexer
+from sglang.srt.layers.attention.qsa import cp_all_gather, qsa_indexer
 from sglang.srt.layers.attention.qsa.mqa import _scoring_dtype, torch_qsa_mqa_prefill
 from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
 from sglang.srt.layers.attention.qwen_sparse_attn_backend import QwenSparseAttnBackend
@@ -17,6 +17,7 @@ from sglang.srt.layers.cp import base as cp_base
 from sglang.srt.layers.cp import zigzag
 from sglang.srt.layers.cp.base import ContextParallelStrategyKind
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_resources
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=13, suite="base-a-test-cpu")
@@ -407,9 +408,10 @@ def test_qsa_cp_cached_prefix_matches_full_context_attention(
     )
     local_positions = logical_positions.index_select(0, local_rows)
 
-    def gather_new_kv(local_kv, forward_batch):
+    def gather_new_kv(local_kv, forward_batch, all_gather):
         events.append("gather")
         assert forward_batch is batch
+        assert all_gather is None, "CPU tensors keep the CP group's all-gather"
         torch.testing.assert_close(
             local_kv, torch.cat([local_k.flatten(1), local_v.flatten(1)], dim=-1)
         )
@@ -538,6 +540,93 @@ def test_qsa_cp_forward_metadata_joins_leftover_prefetch(monkeypatch):
     # Later CP collectives on the main stream must not overlap the gather.
     main.wait_stream.assert_called_once_with(side)
     assert backend._cp_kv_pending is None
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("physical_padding", [False, True])
+def test_zigzag_kv_gather_uses_given_all_gather(monkeypatch, rank, physical_padding):
+    """A replacement all-gather gets this rank's logical rows and returns
+    rank-major blocks; rows past a rank's own never reach the token order."""
+    extend_lens = [8, 5]
+    current = SimpleNamespace(attn_cp_rank=0)
+    monkeypatch.setattr(cp_base, "get_parallel", lambda: current)
+    monkeypatch.setattr(zigzag, "get_device", lambda: SimpleNamespace(device="cpu"))
+    strategy = zigzag.ZigzagCPStrategy(cp_size=2)
+    tokens = torch.arange(sum(extend_lens) * 3, dtype=torch.float32).reshape(-1, 3)
+    metas, inputs, local_rows = [], [], []
+    for cp_rank in range(2):
+        current.attn_cp_rank = cp_rank
+        meta = strategy.build_metadata(sum(extend_lens), extend_lens, extend_lens)
+        logical = list(meta.per_rank_actual_token)
+        if physical_padding:
+            meta.per_rank_logical_token = logical
+            meta.per_rank_actual_token = [max(logical) + 2] * 2
+        rows = strategy.shard_hidden_states(
+            tokens, SimpleNamespace(attn_cp_metadata=meta)
+        )
+        metas.append(meta)
+        inputs.append(rows)
+        local_rows.append(rows[: logical[cp_rank]])
+    calls = []
+
+    def all_gather(local, rows_per_rank):
+        calls.append(rows_per_rank)
+        torch.testing.assert_close(local, local_rows[rank])
+        out = torch.full((2 * rows_per_rank, 3), float("nan"))
+        for peer, rows in enumerate(local_rows):
+            out[peer * rows_per_rank : peer * rows_per_rank + rows.shape[0]] = rows
+        return out
+
+    current.attn_cp_rank = rank
+    batch = SimpleNamespace(attn_cp_metadata=metas[rank])
+    actual = strategy.gather_kv_cache(inputs[rank], batch, all_gather=all_gather)
+    torch.testing.assert_close(actual, tokens)
+    assert calls == [max(rows.shape[0] for rows in local_rows)]
+
+
+def test_qsa_cp_zero_sm_all_gather_is_decided_once_per_process(monkeypatch):
+    from sglang.srt.environ import envs
+
+    verdicts = []
+    gather = SimpleNamespace(all_gather=Mock(return_value="gathered"))
+
+    def create(verdict):
+        def run():
+            verdicts.append(verdict)
+            return (verdict,)
+
+        return run
+
+    monkeypatch.setattr(cp_all_gather, "get_is_capture_mode", lambda: False)
+    on_gpu = SimpleNamespace(is_cuda=True)
+    rows = cp_all_gather._MIN_ROWS_PER_RANK
+
+    def batch(*per_rank_rows):
+        return SimpleNamespace(
+            attn_cp_metadata=SimpleNamespace(per_rank_actual_token=list(per_rank_rows))
+        )
+
+    large = batch(rows, rows - 1)
+    pick = cp_all_gather.qsa_cp_zero_sm_all_gather
+    with get_resources().override(buffers={}):
+        monkeypatch.setattr(cp_all_gather, "_create", create(gather))
+        # CPU tensors, the kill switch and CPU-launch-bound batches keep the CP
+        # group's gather, with no communicator created.
+        assert pick(torch.zeros(1), large, "kv") is None
+        with envs.SGLANG_ENABLE_QSA_CP_ZERO_SM_GATHER.override(False):
+            assert pick(on_gpu, large, "kv") is None
+        assert pick(on_gpu, batch(rows - 1, rows - 1), "kv") is None
+        assert verdicts == []
+        for key in ("kv", "kv", "idx"):
+            assert pick(on_gpu, large, key)(on_gpu, 3) == "gathered"
+            gather.all_gather.assert_called_with(on_gpu, 3, key=key)
+        # Creation is collective: every later call must reuse the verdict.
+        assert verdicts == [gather]
+    with get_resources().override(buffers={}):
+        monkeypatch.setattr(cp_all_gather, "_create", create(None))
+        assert pick(on_gpu, large, "kv") is None
+        assert pick(on_gpu, large, "kv") is None
+        assert verdicts == [gather, None]
 
 
 if __name__ == "__main__":

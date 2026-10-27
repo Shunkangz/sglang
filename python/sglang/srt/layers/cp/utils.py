@@ -260,13 +260,16 @@ def cp_gather_after_forward(x: Any, forward_batch, stream: Optional[Any] = None)
 
 
 def cp_materialize_global_token_order(
-    x: Any, forward_batch, stream: Optional[Any] = None
+    x: Any, forward_batch, stream: Optional[Any] = None, all_gather=None
 ):
-    """Materialize a CP tensor in the global logical token order."""
+    """Materialize a CP tensor in the global logical token order.
+
+    ``all_gather`` replaces the CP group's all-gather; see ``gather_kv_cache``.
+    """
     assert is_cp_active(forward_batch)
     strategy = get_cp_strategy()
     assert strategy is not None
-    return strategy.gather_kv_cache(x, forward_batch, stream)
+    return strategy.gather_kv_cache(x, forward_batch, stream, all_gather=all_gather)
 
 
 @contextmanager

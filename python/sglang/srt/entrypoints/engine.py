@@ -56,6 +56,9 @@ from sglang.srt.arg_groups.overrides import (
     resolved_view,
     resolving_view,
 )
+from sglang.srt.distributed.device_communicators.zero_sm_all_gather import (
+    zero_sm_all_gather_nccl_supported,
+)
 from sglang.srt.elastic_ep.expert_backup_manager import run_expert_backup_manager
 from sglang.srt.entrypoints.engine_info_bootstrap_server import (
     EngineInfoBootstrapServer,
@@ -1873,6 +1876,31 @@ class Engine(EngineScoreMixin, EngineBase):
     # score() and async_score() are provided by EngineScoreMixin
 
 
+def _zero_sm_gather_needs_cumem(cfg) -> bool:
+    """Zero-SM all-gathers receive into NCCL symmetric windows, which require
+    cuMem-backed NCCL memory: the KV-shard prefix gather, and the QSA prefill
+    CP gathers (CP-TP group sharing with zigzag is Qwen4-Exp). Both keep torch
+    memory under the memory saver or a custom mem pool. Multi-node deployments
+    keep NCCL's setting (MNNVL fabrics default it on)."""
+    return (
+        cfg.nnodes == 1
+        and not cfg.enable_memory_saver
+        and envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is None
+        and (
+            (
+                cfg.enable_kv_cache_sharding
+                and envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.get()
+            )
+            or (
+                cfg.enable_cp_tp_group_sharing
+                and cfg.cp_strategy == "zigzag"
+                and envs.SGLANG_ENABLE_QSA_CP_ZERO_SM_GATHER.get()
+            )
+        )
+        and zero_sm_all_gather_nccl_supported()
+    )
+
+
 def _set_envs_and_config(server_args: ServerArgs):
     cfg = resolving_view(server_args)
     # Set global environments
@@ -1882,26 +1910,17 @@ def _set_envs_and_config(server_args: ServerArgs):
     if cfg.nnodes > 1 and is_mnnvl_fabric_device():
         os.environ.setdefault("NCCL_CUMEM_ENABLE", "1")
         os.environ.setdefault("NCCL_MNNVL_ENABLE", "1")
-    # The KV-shard gather registers its scratch as an NCCL symmetric
-    # window, which requires cuMem-backed NCCL memory. The pool keeps torch
-    # memory under the memory saver or a custom mem pool. Multi-node
-    # deployments keep NCCL's setting (MNNVL fabrics default it on above).
-    kv_shard_symmetric_scratch = (
-        cfg.enable_kv_cache_sharding
-        and cfg.nnodes == 1
-        and envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.get()
-        and not cfg.enable_memory_saver
-        and envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is None
-    )
+    zero_sm_gather = _zero_sm_gather_needs_cumem(cfg)
     if "NCCL_CUMEM_ENABLE" not in os.environ or cfg.enable_symm_mem:
-        if kv_shard_symmetric_scratch and not cfg.enable_symm_mem:
+        if zero_sm_gather and not cfg.enable_symm_mem:
             logger.info(
                 "Setting NCCL_CUMEM_ENABLE=1 for every NCCL communicator so the "
-                "KV-shard prefix gather can use a symmetric window. Set "
-                "SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER=0 to keep it off."
+                "zero-SM all-gathers can use symmetric windows. Set "
+                "SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER=0 and "
+                "SGLANG_ENABLE_QSA_CP_ZERO_SM_GATHER=0 to keep it off."
             )
         os.environ["NCCL_CUMEM_ENABLE"] = str(
-            int(cfg.enable_symm_mem or kv_shard_symmetric_scratch)
+            int(cfg.enable_symm_mem or zero_sm_gather)
         )
     if (
         "NCCL_NVLS_ENABLE" not in os.environ

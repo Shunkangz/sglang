@@ -63,12 +63,14 @@ from sglang.srt.distributed.device_communicators.pynccl_wrapper import (
     NCCL_CTA_POLICY_ZERO,
     NCCLLibrary,
 )
+from sglang.srt.distributed.device_communicators.zero_sm_all_gather import (
+    ZERO_SM_ALL_GATHER_MIN_NCCL_VERSION,
+)
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.page_interleave import PageShardSpec, get_kv_shard_group
 from sglang.srt.mem_cache.page_interleave_pool import (
-    _NCCL_SYMMETRIC_SCRATCH_MIN_VERSION,
     PageInterleaveMHATokenToKVPool,
     PageInterleaveMLATokenToKVPool,
     _symmetric_scratch_layout,
@@ -811,7 +813,7 @@ def _run_zero_sm_mla(rank, world, port):
 
 def _run_cross_node_mla(rank, world, port):
     with unittest.mock.patch(
-        "sglang.srt.mem_cache.page_interleave_pool.in_the_same_node_as",
+        "sglang.srt.distributed.device_communicators.zero_sm_all_gather.in_the_same_node_as",
         lambda pg, source_rank: [r == source_rank for r in range(world)],
     ):
         pool, req_to_token, prefix_len, seq_len = _run_mla(rank, world, port)
@@ -928,7 +930,7 @@ def _run_zero_sm_allgather_comparison(rank, world, init_method):
 class TestPageInterleaveZeroSmGatherMultiGpu(CustomTestCase):
     def _require_patched_nccl(self):
         # Gate on the library used by PyNccl, which may differ from torch's.
-        if NCCLLibrary().ncclGetRawVersion() < _NCCL_SYMMETRIC_SCRATCH_MIN_VERSION:
+        if NCCLLibrary().ncclGetRawVersion() < ZERO_SM_ALL_GATHER_MIN_NCCL_VERSION:
             self.skipTest("the symmetric gather scratch needs NCCL >= 2.31.2")
 
     def _compare_allgather(self, world):

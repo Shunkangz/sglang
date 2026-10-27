@@ -63,6 +63,9 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     _release_nccl_window_buffer,
     allocate_symmetric_buffer,
 )
+from sglang.srt.distributed.device_communicators.zero_sm_all_gather import (
+    ZERO_SM_ALL_GATHER_MIN_NCCL_VERSION,
+)
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache import page_interleave
@@ -93,7 +96,6 @@ from sglang.srt.mem_cache.page_interleave import (
     make_page_shard_spec,
 )
 from sglang.srt.mem_cache.page_interleave_pool import (
-    _NCCL_SYMMETRIC_SCRATCH_MIN_VERSION,
     PageInterleaveKVPoolMixin,
     PageInterleaveMHATokenToKVPool,
     PageInterleaveMLATokenToKVPool,
@@ -240,20 +242,20 @@ class TestPageShardScratchSizing(CustomTestCase):
 
 class TestZeroSmScratchLayout(CustomTestCase):
     def test_requires_nccl_with_copy_engine_race_fix(self):
-        self.assertEqual(_NCCL_SYMMETRIC_SCRATCH_MIN_VERSION, 23102)
+        self.assertEqual(ZERO_SM_ALL_GATHER_MIN_NCCL_VERSION, 23102)
         for version in (22902, 23007, 23101, 23102):
             with (
                 self.subTest(version=version),
                 envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.override(True),
                 unittest.mock.patch(
-                    "sglang.srt.mem_cache.page_interleave_pool.is_cuda",
+                    "sglang.srt.distributed.device_communicators.zero_sm_all_gather.is_cuda",
                     return_value=True,
                 ),
                 unittest.mock.patch(
-                    "sglang.srt.mem_cache.page_interleave_pool.NCCLLibrary"
+                    "sglang.srt.distributed.device_communicators.zero_sm_all_gather.NCCLLibrary"
                 ) as library,
                 unittest.mock.patch(
-                    "sglang.srt.mem_cache.page_interleave_pool.in_the_same_node_as",
+                    "sglang.srt.distributed.device_communicators.zero_sm_all_gather.in_the_same_node_as",
                     return_value=[True, True],
                 ) as same_node,
             ):
@@ -264,9 +266,9 @@ class TestZeroSmScratchLayout(CustomTestCase):
                         custom_mem_pool=None,
                         shard_group=SimpleNamespace(cpu_group=object()),
                     ),
-                    version >= _NCCL_SYMMETRIC_SCRATCH_MIN_VERSION,
+                    version >= ZERO_SM_ALL_GATHER_MIN_NCCL_VERSION,
                 )
-                if version < _NCCL_SYMMETRIC_SCRATCH_MIN_VERSION:
+                if version < ZERO_SM_ALL_GATHER_MIN_NCCL_VERSION:
                     same_node.assert_not_called()
 
     def test_slot_tensors_are_window_aligned_and_disjoint(self):
