@@ -1929,6 +1929,17 @@ class Qwen4ExpAttentionDecoderLayer(
             # and writes QSA-private pool buffers.
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
+        prefetch_cp = (
+            self.is_qsa
+            and _shards_rows_over_cp(forward_batch)
+            and not get_is_capture_mode()
+        )
+        if prefetch_cp:
+            # Every CP rank issues the gathers in one order. On copy engines the
+            # index-key gather runs here, under the qkv projection, and the K/V
+            # gather behind it under the indexer; otherwise only the K/V
+            # gather is prefetched and the key gather runs in the indexer.
+            self.indexer.prefetch_cp_keys(hidden_states, forward_batch)
 
         q, k, v, gate = self._prepare_qkv_gate(
             positions=positions,
@@ -1947,13 +1958,11 @@ class Qwen4ExpAttentionDecoderLayer(
             topk_indices.record_stream(current_stream)
             attention_kwargs["topk_indices"] = topk_indices
         elif self.is_qsa:
-            if _shards_rows_over_cp(forward_batch) and not get_is_capture_mode():
+            if prefetch_cp:
                 from sglang.srt.layers.attention.qsa.glue import (
                     resolve_qsa_sparse_backend,
                 )
 
-                # Every CP rank issues the K/V gather before the index-key
-                # gather, overlapping it with the indexer's local computation.
                 resolve_qsa_sparse_backend(get_attn_backend()).prefetch_cp_kv(
                     self.attn, k, v, forward_batch
                 )

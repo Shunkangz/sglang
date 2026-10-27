@@ -111,7 +111,13 @@ def test_qsa_model_forward_prefetches_exact_kv_before_indexer(
         events.append("prepare")
         return q, k, v, None
 
-    def indexer(actual_hidden, actual_positions, actual_batch, actual_meta, **kwargs):
+    def prefetch_keys(actual_hidden, actual_batch):
+        assert actual_hidden is hidden and actual_batch is batch
+        events.append("prefetch_keys")
+
+    def run_indexer(
+        actual_hidden, actual_positions, actual_batch, actual_meta, **kwargs
+    ):
         assert actual_hidden is hidden and actual_positions is positions
         assert actual_batch is batch and actual_meta is metadata
         assert ("cp_global_rope_positions" in kwargs) == cp_enabled
@@ -135,7 +141,7 @@ def test_qsa_model_forward_prefetches_exact_kv_before_indexer(
         _qsa_prefill_topk_bridges=[],
         _prepare_attn_stage=lambda value, *args: value,
         _prepare_qkv_gate=prepare,
-        indexer=indexer,
+        indexer=Mock(side_effect=run_indexer, prefetch_cp_keys=prefetch_keys),
         attn=attention,
         o_proj=lambda value: (value, None),
         attn_boundary=SimpleNamespace(finish=lambda value, _: value),
@@ -149,7 +155,9 @@ def test_qsa_model_forward_prefetches_exact_kv_before_indexer(
         setattr(layer, name, getattr(decoder, name).__get__(layer))
 
     assert decoder.forward(layer, positions, hidden, batch) is expected
+    # The key gather runs under the qkv projection, the K/V gather after it.
     assert events == [
+        *(["prefetch_keys"] if prefetch_expected else []),
         "prepare",
         *(["prefetch"] if prefetch_expected else []),
         "indexer",
@@ -180,9 +188,10 @@ def test_cuda_indexer_forwards_global_rope_to_cp_path():
     )
 
 
+@pytest.mark.parametrize("prefetch", ["none", "this_batch", "stale"])
 @pytest.mark.parametrize("compressed_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 def test_cp_indexer_matches_compressed_dtype_without_storing_local_keys(
-    monkeypatch, compressed_dtype
+    monkeypatch, compressed_dtype, prefetch
 ):
     local_rows = torch.tensor([0, 1, 6, 7])
     hidden = (torch.arange(32).reshape(8, 4) / 13).to(torch.bfloat16)
@@ -216,8 +225,10 @@ def test_cp_indexer_matches_compressed_dtype_without_storing_local_keys(
         monkeypatch.setattr(qsa_indexer, name, lambda value, batch: value[local_rows])
     events = []
 
-    def gather_raw_keys(local, batch):
+    def gather_raw_keys(local, batch, all_gather):
         torch.testing.assert_close(local, hidden[local_rows])
+        # Inline, the key gather shares the CP group with the K/V prefetch.
+        assert all_gather is None
         events.append("key_gather")
         return hidden
 
@@ -249,9 +260,21 @@ def test_cp_indexer_matches_compressed_dtype_without_storing_local_keys(
         ),
         select_prefill_tokens=score_queries,
     )
-    indexer.project_qk = lambda *args, **kwargs: QSAIndexer.project_qk(
-        indexer, *args, **kwargs
-    )
+    indexer._cp_key_pending = None
+    for name in ("_project_index_q", "_gather_cp_keys"):
+        setattr(indexer, name, getattr(QSAIndexer, name).__get__(indexer))
+    main, side, ready = Mock(), Mock(), Mock()
+    main.wait_event.side_effect = lambda event: events.append("join")
+    side.wait_stream.side_effect = lambda stream: events.append("release")
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: main)
+    monkeypatch.setattr(qsa_indexer, "get_stream", lambda name: side)
+    if prefetch != "none":
+        # What prefetch_cp_keys leaves: the projection and the gathered keys.
+        qk = torch.cat([hidden[local_rows], hidden[local_rows]], dim=-1)
+        owner = batch if prefetch == "this_batch" else SimpleNamespace()
+        indexer._cp_key_pending = (owner, qk, hidden.unsqueeze(1), ready)
+    if prefetch == "this_batch":
+        indexer.index_qk_proj = Mock(side_effect=AssertionError("projected twice"))
     actual = QSAIndexer.forward_cuda_cp(
         indexer,
         hidden[local_rows],
@@ -260,8 +283,20 @@ def test_cp_indexer_matches_compressed_dtype_without_storing_local_keys(
         metadata,
         positions,
     )
-    # Compression needs the globally ordered raw keys on every rank.
-    assert events == ["key_gather", "compress"]
+    # Compression needs the globally ordered raw keys on every rank: the
+    # prefetched gather is joined before it, and a stale one is joined too.
+    # The side stream frees the prefetched keys only after compression reads.
+    assert (
+        events
+        == {
+            "none": ["key_gather", "compress"],
+            "this_batch": ["join", "compress", "release"],
+            "stale": ["key_gather", "join", "compress", "release"],
+        }[prefetch]
+    )
+    assert indexer._cp_key_pending is None
+    if prefetch != "none":
+        main.wait_event.assert_called_once_with(ready)
     expected = torch_qsa_mqa_prefill(
         hidden[local_rows].unsqueeze(1).to(compressed_dtype),
         compressed_keys,
@@ -275,6 +310,87 @@ def test_cp_indexer_matches_compressed_dtype_without_storing_local_keys(
     update = indexer.update_key_state_and_compress.call_args
     torch.testing.assert_close(update.args[0], hidden.unsqueeze(1))
     assert update.kwargs["state_stored"] is False
+
+
+@pytest.mark.parametrize("leftover", [False, True])
+@pytest.mark.parametrize("zero_sm", [False, True])
+def test_cp_indexer_prefetch_gathers_keys_on_the_side_stream(
+    monkeypatch, zero_sm, leftover
+):
+    hidden = torch.randn(6, 4)
+    batch = SimpleNamespace(
+        attn_cp_metadata=SimpleNamespace(total_q_prev_tokens=2, total_q_next_tokens=2)
+    )
+    calls = Mock()
+    side, main, ready = calls.side, calls.main, calls.ready
+    in_side_stream = []
+    all_gather = Mock()
+    monkeypatch.setattr(
+        qsa_indexer,
+        "qsa_cp_zero_sm_all_gather",
+        lambda x, actual_batch, key: (
+            all_gather
+            if zero_sm and actual_batch is batch and key == "index_k"
+            else None
+        ),
+    )
+    monkeypatch.setattr(qsa_indexer, "get_stream", lambda name: side)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: main)
+    monkeypatch.setattr(torch.cuda, "Event", lambda: ready)
+
+    @contextmanager
+    def use_stream(stream):
+        in_side_stream.append(stream is side)
+        yield
+        in_side_stream.append(False)
+
+    monkeypatch.setattr(torch.cuda, "stream", use_stream)
+
+    def gather(local, actual_batch, all_gather):
+        calls.gather(local, all_gather)
+        assert in_side_stream[-1], "the key gather must run on the side stream"
+        return torch.cat([local, local])
+
+    monkeypatch.setattr(qsa_indexer, "cp_materialize_global_token_order", gather)
+
+    def project(value):
+        calls.project()
+        return torch.cat([value, 2 * value], dim=-1), None
+
+    stale = calls.stale
+    indexer = SimpleNamespace(
+        index_n_heads=1,
+        index_kv_heads=1,
+        index_head_dim=4,
+        index_qk_proj=project,
+        # Left by a forward that failed before this layer's indexer.
+        _cp_key_pending=(object(), None, None, stale) if leftover else None,
+        _cp_key_ready=None,
+    )
+    indexer._gather_cp_keys = QSAIndexer._gather_cp_keys.__get__(indexer)
+    QSAIndexer.prefetch_cp_keys(indexer, hidden, batch)
+    if not zero_sm:
+        # On the CP group's SM kernels the gather stays inline, behind the K/V one.
+        assert calls.mock_calls == []
+        return
+    owner, qk, keys, event = indexer._cp_key_pending
+    assert owner is batch and event is ready
+    torch.testing.assert_close(qk, torch.cat([hidden[:4], 2 * hidden[:4]], dim=-1))
+    torch.testing.assert_close(keys, torch.cat([2 * hidden[:4]] * 2).unsqueeze(1))
+    # Join a leftover, fork after the projection, gather, then mark it ready.
+    order = [c[0] for c in calls.mock_calls]
+    assert order == ["main.wait_event"] * leftover + [
+        "project",
+        "side.wait_stream",
+        "gather",
+        "ready.record",
+    ]
+    by_name = {c[0]: c for c in calls.mock_calls}
+    if leftover:
+        assert by_name["main.wait_event"].args == (stale,)
+    assert by_name["side.wait_stream"].args == (main,)
+    assert by_name["gather"].args[1] is all_gather
+    assert by_name["ready.record"].args == (side,)
 
 
 def _cpu_sparse_chunk_attention(q, k, v, indices, cu_q, cu_k, kv_lens, scale):

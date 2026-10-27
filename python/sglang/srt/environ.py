@@ -618,8 +618,9 @@ class Envs:
     # communicator. Leave NCCL_CTA_POLICY unset to preserve per-comm policies.
     # The engine defaults NCCL cuMem on for eligible single-node deployments.
     SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER = EnvBool(True)
-    # QSA prefill CP (Qwen4-Exp, CP-TP group sharing): run the prefetched K/V
-    # all-gather on copy engines over a dedicated communicator. Single node,
+    # QSA prefill CP (Qwen4-Exp, CP-TP group sharing): prefetch the index-key
+    # all-gather under the qkv projection and the K/V all-gather under the
+    # indexer, on copy engines over a dedicated communicator. Single node,
     # NCCL >= 2.31.2; the engine defaults NCCL cuMem on for it.
     SGLANG_ENABLE_QSA_CP_ZERO_SM_GATHER = EnvBool(True)
 

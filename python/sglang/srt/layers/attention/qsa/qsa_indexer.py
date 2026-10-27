@@ -7,6 +7,7 @@ from typing import Optional, Tuple
 import torch
 
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.layers.attention.qsa.cp_all_gather import qsa_cp_zero_sm_all_gather
 from sglang.srt.layers.attention.qsa.kernel import (
     average_pool_qsa_keys,
     expand_qsa_block_indices,
@@ -35,6 +36,7 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.runtime_context import get_stream
 
 # Cap on the fp32 [query_rows, compressed_keys] prefill logits workspace;
 # top-k is per row, so tiling rows does not change the selection.
@@ -93,6 +95,10 @@ class QSAIndexer(MultiPlatformOp):
             self.index_head_dim, eps=getattr(config, "rms_norm_eps", 1e-6)
         )
         self._rope_axis_map_cache = None
+        # (forward_batch, index q/k rows, gathered raw keys, ready event) of
+        # the prefill-CP key gather prefetch_cp_keys started.
+        self._cp_key_pending = None
+        self._cp_key_ready = None
 
     @staticmethod
     def _validate_config(config) -> None:
@@ -212,6 +218,16 @@ class QSAIndexer(MultiPlatformOp):
                 out_dtype=pool.qsa_compressed_dtype,
             )
             return q, token_k, True
+        q = self._project_index_q(qk, positions, pool, ensure_cos_sin_cache)
+        return q, token_k, False
+
+    def _project_index_q(
+        self,
+        qk: torch.Tensor,
+        positions: torch.Tensor,
+        pool,
+        ensure_cos_sin_cache: bool,
+    ) -> torch.Tensor:
         q_raw = qk[:, : self.index_n_heads * self.index_head_dim]
         q = self.q_layernorm(q_raw.reshape(-1, self.index_head_dim)).reshape(
             -1, self.index_n_heads, self.index_head_dim
@@ -219,7 +235,7 @@ class QSAIndexer(MultiPlatformOp):
         q = self.apply_rope(positions, q, ensure_cos_sin_cache=ensure_cos_sin_cache)
         if pool is not None:
             q = q.to(pool.qsa_compressed_dtype)
-        return q, token_k, False
+        return q
 
     def normalize_compressed_keys(
         self, compressed_keys: torch.Tensor, block_positions: torch.Tensor
@@ -587,6 +603,48 @@ class QSAIndexer(MultiPlatformOp):
             token_topk=self.token_topk,
         )
 
+    def prefetch_cp_keys(self, hidden_states: torch.Tensor, forward_batch) -> None:
+        """Prefill CP: project this rank's index q/k rows and start the raw-key
+        gather on the qsa_cp_kv stream, under the attention's qkv projection;
+        this layer's forward_cuda_cp joins it.
+
+        Call it on every rank before the attention's K/V prefetch, which then
+        queues behind it on the same stream and communicator. Without the
+        copy-engine all-gather the gather stays inline in forward_cuda_cp."""
+        meta = forward_batch.attn_cp_metadata
+        num_local = int(meta.total_q_prev_tokens + meta.total_q_next_tokens)
+        all_gather = qsa_cp_zero_sm_all_gather(hidden_states, forward_batch, "index_k")
+        if all_gather is None:
+            return
+        if self._cp_key_pending is not None:
+            # Left by a forward that failed before this layer's indexer.
+            torch.cuda.current_stream().wait_event(self._cp_key_pending[-1])
+        qk, _ = self.index_qk_proj(hidden_states[:num_local])
+        stream = get_stream("qsa_cp_kv")
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            token_k_full = self._gather_cp_keys(qk, forward_batch, all_gather)
+        if self._cp_key_ready is None:
+            self._cp_key_ready = torch.cuda.Event()
+        # Re-recording is safe: the join already waited on the last record.
+        ready = self._cp_key_ready
+        ready.record(stream)
+        # qk is read on the side stream and token_k_full allocated there: the
+        # join's wait_event and its release wait order both lifetimes.
+        self._cp_key_pending = (forward_batch, qk, token_k_full, ready)
+
+    def _gather_cp_keys(self, qk: torch.Tensor, forward_batch, all_gather):
+        # Raw keys of all new tokens in global packed order: the ring store
+        # and compression use the global write plan unchanged. Cached prefix
+        # groups already reside in the compressed-K pool on every rank.
+        token_k = qk[:, self.index_n_heads * self.index_head_dim :]
+        if all_gather is None:
+            # The CP group's all-gather sends a contiguous buffer.
+            token_k = token_k.contiguous()
+        return cp_materialize_global_token_order(
+            token_k, forward_batch, all_gather=all_gather
+        ).reshape(-1, self.index_kv_heads, self.index_head_dim)
+
     def forward_cuda_cp(
         self,
         hidden_states: torch.Tensor,
@@ -625,27 +683,30 @@ class QSAIndexer(MultiPlatformOp):
         local_sequence_ids = cp_shard_hidden_states(
             indexer_metadata.get_token_to_batch_idx(), forward_batch
         )[:num_local]
-        hidden_states = hidden_states[:num_local]
         positions = (
             positions[:, :num_local] if positions.ndim == 2 else positions[:num_local]
         )
-        # Use the compressed-cache dtype for Q. Leaving cache_loc unset defers
-        # the ring store until raw local K has been gathered into global order.
+        prefetched, self._cp_key_pending = self._cp_key_pending, None
+        token_k_full = None
+        if prefetched is not None and prefetched[0] is forward_batch:
+            _, qk, token_k_full, _ = prefetched
+        else:
+            qk, _ = self.index_qk_proj(hidden_states[:num_local])
+        # Use the compressed-cache dtype for Q. The ring store waits for the
+        # raw local K to be gathered into global order.
         # The load-time RoPE reservation covers these positions, as this layer's
         # attention already assumed; re-checking costs a device sync per layer.
-        q, token_k, _ = self.project_qk(
-            hidden_states,
+        q = self._project_index_q(
+            qk,
             positions,
             pool=indexer_metadata.token_to_kv_pool,
             ensure_cos_sin_cache=False,
         )
-        # Raw keys of all new tokens in global packed order: the ring store
-        # and compression use the global write plan unchanged. Cached prefix
-        # groups already reside in the compressed-K pool on every rank.
-        token_k_local = token_k.reshape(num_local, -1).contiguous()
-        token_k_full = cp_materialize_global_token_order(
-            token_k_local, forward_batch
-        ).reshape(-1, self.index_kv_heads, self.index_head_dim)
+        if token_k_full is None:
+            token_k_full = self._gather_cp_keys(qk, forward_batch, all_gather=None)
+        if prefetched is not None:
+            # Also joins a gather a failed forward left behind.
+            torch.cuda.current_stream().wait_event(prefetched[-1])
         global_rope = (
             global_rope_positions[:, :num_global]
             if global_rope_positions.ndim == 2
@@ -659,6 +720,10 @@ class QSAIndexer(MultiPlatformOp):
             state_slots=indexer_metadata.pending_ring_slots,
             state_stored=False,
         )
+        if prefetched is not None:
+            # The prefetched keys live in the side stream's pool; order their
+            # release there (unmap, cudaFreeAsync) after this stream's reads.
+            get_stream("qsa_cp_kv").wait_stream(torch.cuda.current_stream())
         compressed_keys, row_starts, row_ends, sequence_lengths = (
             indexer_metadata.get_prefill_mqa_inputs(
                 self.layer_id, local_logical, query_sequence_ids=local_sequence_ids
