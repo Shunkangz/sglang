@@ -1651,6 +1651,9 @@ class QwenSparseAttnBackend(AttentionBackend):
                 layer.scaling,
                 max_q=meta.max_seqlen_q_combined,
             )
+            if pending is not None:
+                # Only the pool write above read the gathered K/V; see below.
+                get_stream("qsa_cp_kv").wait_stream(torch.cuda.current_stream())
             return self._pad_extend_output(output, num_output_rows)
         if any(prefix_lens):
             # The all-gather contains only new tokens. Prefix K/V is already
