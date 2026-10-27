@@ -52,9 +52,6 @@ class TestZeroSMGatherNeedsCuMem(CustomTestCase):
                 self.assertFalse(self._needs(cfg))
         with self.subTest("NCCL < 2.31.2"):
             self.assertFalse(self._needs(_cfg(), nccl_supported=False))
-        with self.subTest("kill switch"):
-            with envs.SGLANG_ENABLE_QSA_CP_ZERO_SM_GATHER.override(False):
-                self.assertFalse(self._needs(_cfg()))
         with self.subTest("custom mem pool"):
             with envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.override("NVLINK"):
                 self.assertFalse(self._needs(_cfg()))

@@ -1879,9 +1879,9 @@ class Engine(EngineScoreMixin, EngineBase):
 def _zero_sm_gather_needs_cumem(cfg) -> bool:
     """Zero-SM all-gathers receive into NCCL symmetric windows, which require
     cuMem-backed NCCL memory: the KV-shard prefix gather, and the QSA prefill
-    CP gathers (CP-TP group sharing with zigzag is Qwen4-Exp). Both keep torch
-    memory under the memory saver or a custom mem pool. Multi-node deployments
-    keep NCCL's setting (MNNVL fabrics default it on)."""
+    CP gathers (CP-TP group sharing with zigzag is Qwen4-Exp). Neither is used
+    under the memory saver or a custom mem pool. Multi-node deployments keep
+    NCCL's setting (MNNVL fabrics default it on)."""
     return (
         cfg.nnodes == 1
         and not cfg.enable_memory_saver
@@ -1891,11 +1891,7 @@ def _zero_sm_gather_needs_cumem(cfg) -> bool:
                 cfg.enable_kv_cache_sharding
                 and envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.get()
             )
-            or (
-                cfg.enable_cp_tp_group_sharing
-                and cfg.cp_strategy == "zigzag"
-                and envs.SGLANG_ENABLE_QSA_CP_ZERO_SM_GATHER.get()
-            )
+            or (cfg.enable_cp_tp_group_sharing and cfg.cp_strategy == "zigzag")
         )
         and zero_sm_all_gather_nccl_supported()
     )
@@ -1916,8 +1912,7 @@ def _set_envs_and_config(server_args: ServerArgs):
             logger.info(
                 "Setting NCCL_CUMEM_ENABLE=1 for every NCCL communicator so the "
                 "zero-SM all-gathers can use symmetric windows. Set "
-                "SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER=0 and "
-                "SGLANG_ENABLE_QSA_CP_ZERO_SM_GATHER=0 to keep it off."
+                "NCCL_CUMEM_ENABLE=0 to keep it off."
             )
         os.environ["NCCL_CUMEM_ENABLE"] = str(
             int(cfg.enable_symm_mem or zero_sm_gather)

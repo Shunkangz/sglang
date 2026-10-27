@@ -23,9 +23,8 @@ from sglang.srt.distributed.device_communicators.zero_sm_all_gather import (
     ZERO_SM_ALL_GATHER_MIN_NCCL_VERSION,
     ZeroSMAllGather,
 )
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention import qwen_sparse_attn_backend
-from sglang.srt.layers.attention.qsa import cp_all_gather
+from sglang.srt.layers.cp import utils as cp_utils
 from sglang.srt.layers.cp.base import get_cp_strategy, init_cp_strategy
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_parallel, publish
@@ -127,10 +126,10 @@ def _run(rank, world, init_method):
 
 
 def _check_qsa_kv_gather(world, rank):
-    """QSA's K/V gather matches the CP group's SM gather; batches with few new
-    tokens per rank keep the SM gather."""
+    """QSA's K/V gather returns the global K/V; batches with few new tokens per
+    rank keep the CP group's SM gather."""
     init_cp_strategy(enable_prefill_cp=True, cp_size=world, cp_strategy="zigzag")
-    min_rows = cp_all_gather._MIN_ROWS_PER_RANK
+    min_rows = cp_utils._ZERO_SM_MIN_ROWS_PER_RANK
     for extend_lens, zero_sm in (
         ([37, 64 * world + 3], False),
         ([37, min_rows * world + 3], True),
@@ -158,34 +157,24 @@ def _compare_qsa_kv_gather(world, extend_lens, zero_sm):
     local_v = strategy.shard_hidden_states(v, batch)
     # The first call may create the communicator (a warmup all-reduce) and window.
     qwen_sparse_attn_backend._gather_cp_kv(layer, local_k, local_v, batch)
-    outputs, activity = {}, {}
-    for enabled in (False, True):
+    torch.cuda.synchronize()
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA]
+    ) as prof:
+        full_k, full_v = qwen_sparse_attn_backend._gather_cp_kv(
+            layer, local_k, local_v, batch
+        )
         torch.cuda.synchronize()
-        with (
-            envs.SGLANG_ENABLE_QSA_CP_ZERO_SM_GATHER.override(enabled),
-            torch.profiler.profile(
-                activities=[torch.profiler.ProfilerActivity.CUDA]
-            ) as prof,
-        ):
-            outputs[enabled] = qwen_sparse_attn_backend._gather_cp_kv(
-                layer, local_k, local_v, batch
-            )
-            torch.cuda.synchronize()
-        activity[enabled] = [
-            event.name
-            for event in prof.events()
-            if event.device_type == torch.autograd.DeviceType.CUDA
-        ]
-    # Equal outputs alone would not show which path ran.
-    assert any("nccl" in name.lower() for name in activity[False]), activity
-    on_copy_engines = not any("nccl" in name.lower() for name in activity[True])
+    activity = [
+        event.name
+        for event in prof.events()
+        if event.device_type == torch.autograd.DeviceType.CUDA
+    ]
+    on_copy_engines = not any("nccl" in name.lower() for name in activity)
     assert on_copy_engines == zero_sm, (extend_lens, activity)
     if zero_sm:
-        assert any("PtoP" in name for name in activity[True]), activity
-    for full, expected in zip(outputs[True], (k, v)):
-        assert torch.equal(full, expected)
-    for sm, ce in zip(outputs[False], outputs[True]):
-        assert torch.equal(sm, ce)
+        assert any("PtoP" in name for name in activity), activity
+    assert torch.equal(full_k, k) and torch.equal(full_v, v)
 
 
 @unittest.skipIf(torch.cuda.device_count() < 2, "needs 2 CUDA devices")

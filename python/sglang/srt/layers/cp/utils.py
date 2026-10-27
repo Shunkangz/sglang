@@ -14,9 +14,14 @@
 
 """Public import facade and runtime helpers for context parallel strategies."""
 
+import logging
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, Optional, Tuple
+from functools import partial
+from typing import TYPE_CHECKING, Any, Callable, Optional, Tuple
 
+from sglang.srt.distributed.device_communicators.zero_sm_all_gather import (
+    ZeroSMAllGather,
+)
 from sglang.srt.layers.cp.base import (
     BaseContextParallelMetadata,
     ContextParallelStrategy,
@@ -36,10 +41,19 @@ from sglang.srt.layers.cp.zigzag import (
     ZigzagCPStrategy,
 )
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
-from sglang.srt.runtime_context import get_parallel, uses_mla_backend
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
+from sglang.srt.runtime_context import get_buffer, get_parallel, uses_mla_backend
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+logger = logging.getLogger(__name__)
+
+# A copy-engine gather costs more host time than an SM one (NCCL's CE enqueue
+# takes 46 us at 4 ranks and 74 us at 8, the ring kernel 22 us), so it pays
+# off only once the GPU, not the CPU, bounds the forward. Measured on QSA
+# layers on B200, CP4 and CP8: 2048 rows per rank lose 2-4%, 3072 win 3-5%.
+_ZERO_SM_MIN_ROWS_PER_RANK = 3072
 
 
 def is_glm_dsa_cache_layer_split_enabled(model_runner: "ModelRunner") -> bool:
@@ -270,6 +284,36 @@ def cp_materialize_global_token_order(
     strategy = get_cp_strategy()
     assert strategy is not None
     return strategy.gather_kv_cache(x, forward_batch, stream, all_gather=all_gather)
+
+
+def cp_zero_sm_all_gather(
+    x: Any, forward_batch, key: str
+) -> Optional[Callable[[Any, int], Any]]:
+    """A copy-engine all-gather over the CP group for ``key`` (the
+    ``all_gather`` of cp_materialize_global_token_order), or None to keep the
+    group's SM kernels. It frees SMs only for work on other streams, so use it
+    for gathers that overlap compute. Every CP rank gets the same answer for a
+    batch; the first batch that uses it creates it, in the same call on every
+    rank."""
+    if (
+        not x.is_cuda
+        or max(forward_batch.attn_cp_metadata.per_rank_actual_token)
+        < _ZERO_SM_MIN_ROWS_PER_RANK
+        or get_is_capture_mode()
+    ):
+        return None
+    (gather,) = get_buffer("cp_zero_sm_all_gather", _create_zero_sm_all_gather)
+    return None if gather is None else partial(gather.all_gather, key=key)
+
+
+def _create_zero_sm_all_gather() -> Tuple[Optional[ZeroSMAllGather]]:
+    gather = ZeroSMAllGather.create(get_parallel().attn_cp_group)
+    logger.info(
+        "CP all-gathers that overlap compute run on %s.",
+        "copy engines" if gather is not None else "the CP group's SM kernels",
+    )
+    # A 1-tuple, so an unsupported verdict is kept as well.
+    return (gather,)
 
 
 @contextmanager

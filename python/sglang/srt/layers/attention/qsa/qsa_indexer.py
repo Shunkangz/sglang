@@ -7,7 +7,6 @@ from typing import Optional, Tuple
 import torch
 
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
-from sglang.srt.layers.attention.qsa.cp_all_gather import qsa_cp_zero_sm_all_gather
 from sglang.srt.layers.attention.qsa.kernel import (
     average_pool_qsa_keys,
     expand_qsa_block_indices,
@@ -29,6 +28,7 @@ from sglang.srt.layers.cp.utils import (
     cp_materialize_global_token_order,
     cp_shard_hidden_states,
     cp_shard_position_ids,
+    cp_zero_sm_all_gather,
     get_cp_strategy,
 )
 from sglang.srt.layers.layernorm import GemmaRMSNorm
@@ -613,7 +613,7 @@ class QSAIndexer(MultiPlatformOp):
         copy-engine all-gather the gather stays inline in forward_cuda_cp."""
         meta = forward_batch.attn_cp_metadata
         num_local = int(meta.total_q_prev_tokens + meta.total_q_next_tokens)
-        all_gather = qsa_cp_zero_sm_all_gather(hidden_states, forward_batch, "index_k")
+        all_gather = cp_zero_sm_all_gather(hidden_states, forward_batch, "index_k")
         if all_gather is None:
             return
         if self._cp_key_pending is not None:

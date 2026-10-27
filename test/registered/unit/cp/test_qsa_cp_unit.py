@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from sglang.srt.layers.attention import qwen_sparse_attn_backend
-from sglang.srt.layers.attention.qsa import cp_all_gather, qsa_indexer
+from sglang.srt.layers.attention.qsa import qsa_indexer
 from sglang.srt.layers.attention.qsa.mqa import _scoring_dtype, torch_qsa_mqa_prefill
 from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
 from sglang.srt.layers.attention.qwen_sparse_attn_backend import QwenSparseAttnBackend
@@ -327,7 +327,7 @@ def test_cp_indexer_prefetch_gathers_keys_on_the_side_stream(
     all_gather = Mock()
     monkeypatch.setattr(
         qsa_indexer,
-        "qsa_cp_zero_sm_all_gather",
+        "cp_zero_sm_all_gather",
         lambda x, actual_batch, key: (
             all_gather
             if zero_sm and actual_batch is batch and key == "index_k"
@@ -700,8 +700,8 @@ def test_zigzag_kv_gather_uses_given_all_gather(monkeypatch, rank, physical_padd
     assert calls == [max(rows.shape[0] for rows in local_rows)]
 
 
-def test_qsa_cp_zero_sm_all_gather_is_decided_once_per_process(monkeypatch):
-    from sglang.srt.environ import envs
+def test_cp_zero_sm_all_gather_is_decided_once_per_process(monkeypatch):
+    from sglang.srt.layers.cp import utils as cp_utils
 
     verdicts = []
     gather = SimpleNamespace(all_gather=Mock(return_value="gathered"))
@@ -713,9 +713,9 @@ def test_qsa_cp_zero_sm_all_gather_is_decided_once_per_process(monkeypatch):
 
         return run
 
-    monkeypatch.setattr(cp_all_gather, "get_is_capture_mode", lambda: False)
+    monkeypatch.setattr(cp_utils, "get_is_capture_mode", lambda: False)
     on_gpu = SimpleNamespace(is_cuda=True)
-    rows = cp_all_gather._MIN_ROWS_PER_RANK
+    rows = cp_utils._ZERO_SM_MIN_ROWS_PER_RANK
 
     def batch(*per_rank_rows):
         return SimpleNamespace(
@@ -723,14 +723,12 @@ def test_qsa_cp_zero_sm_all_gather_is_decided_once_per_process(monkeypatch):
         )
 
     large = batch(rows, rows - 1)
-    pick = cp_all_gather.qsa_cp_zero_sm_all_gather
+    pick = cp_utils.cp_zero_sm_all_gather
     with get_resources().override(buffers={}):
-        monkeypatch.setattr(cp_all_gather, "_create", create(gather))
-        # CPU tensors, the kill switch and CPU-launch-bound batches keep the CP
-        # group's gather, with no communicator created.
+        monkeypatch.setattr(cp_utils, "_create_zero_sm_all_gather", create(gather))
+        # CPU tensors and CPU-launch-bound batches keep the CP group's gather,
+        # with no communicator created.
         assert pick(torch.zeros(1), large, "kv") is None
-        with envs.SGLANG_ENABLE_QSA_CP_ZERO_SM_GATHER.override(False):
-            assert pick(on_gpu, large, "kv") is None
         assert pick(on_gpu, batch(rows - 1, rows - 1), "kv") is None
         assert verdicts == []
         for key in ("kv", "kv", "idx"):
@@ -739,7 +737,7 @@ def test_qsa_cp_zero_sm_all_gather_is_decided_once_per_process(monkeypatch):
         # Creation is collective: every later call must reuse the verdict.
         assert verdicts == [gather]
     with get_resources().override(buffers={}):
-        monkeypatch.setattr(cp_all_gather, "_create", create(None))
+        monkeypatch.setattr(cp_utils, "_create_zero_sm_all_gather", create(None))
         assert pick(on_gpu, large, "kv") is None
         assert pick(on_gpu, large, "kv") is None
         assert verdicts == [gather, None]

@@ -21,7 +21,6 @@ from sglang.srt.layers.attention.qsa.config import (
     is_qwen_qsa,
     parse_qsa_profile,
 )
-from sglang.srt.layers.attention.qsa.cp_all_gather import qsa_cp_zero_sm_all_gather
 from sglang.srt.layers.attention.qsa.fused_kv import fused_kv_prepare
 from sglang.srt.layers.attention.qsa.kernel import (
     expand_qsa_block_indices,
@@ -48,6 +47,7 @@ from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_ver
 from sglang.srt.layers.cp.utils import (
     ContextParallelStrategyKind,
     cp_materialize_global_token_order,
+    cp_zero_sm_all_gather,
     get_cp_strategy,
     is_cp_active,
 )
@@ -140,7 +140,7 @@ def _gather_cp_kv(
     kv_full = cp_materialize_global_token_order(
         kv_local,
         forward_batch,
-        all_gather=qsa_cp_zero_sm_all_gather(kv_local, forward_batch, "kv"),
+        all_gather=cp_zero_sm_all_gather(kv_local, forward_batch, "kv"),
     )
     k_full, v_full = kv_full.split([k_width, v_width], dim=-1)
     k_full = k_full.reshape(-1, k.shape[1], k.shape[2]).contiguous()
