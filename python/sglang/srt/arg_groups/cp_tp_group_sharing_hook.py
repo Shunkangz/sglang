@@ -17,9 +17,9 @@ from sglang.srt.runtime_context import get_platform
 
 # Architectures whose model code implements CP-TP group sharing: the CP group
 # is the TP group, the residual stream / attention / indexer are CP-sharded,
-# MoE and linear attention keep their TP partition (the linear attention
-# gathers the sequence where its recurrence needs it). Model ports register
-# here; every other model keeps the ordinary prefill CP path.
+# linear attention keeps its TP head partition and gathers the sequence for
+# its recurrence. MoE retains its configured TP/EP layout. Model ports register
+# here; unported linear-attention models are rejected.
 _SUPPORTED_MODELS: set[str] = {
     # GLM
     "Glm5NextForConditionalGeneration",
@@ -44,6 +44,7 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
             )
         return
     is_kimi = architecture.startswith("Kimi")
+    is_kimi_k3 = architecture.startswith("KimiK3")
     # Attention DP or attention TP would leave the CP group narrower than TP.
     if view.attn_cp_size != cfg.tp_size:
         raise ValueError(
@@ -85,15 +86,22 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
     }
     if architecture == "Qwen4ExpForConditionalGeneration" or is_kimi:
         unsupported |= {
-            # The MoE runs TP experts on rows gathered over the TP group.
             # Waterfill turns on DeepEP and EP after this hook.
-            "ep-size > 1": view.ep_size > 1,
-            "moe-a2a-backend": view.moe_a2a_backend != "none",
             "enable-waterfill": cfg.enable_waterfill,
             "pp-size > 1": cfg.pp_size > 1,
             # Prefill only: a decode node serves plain TP.
             "disaggregation-mode decode": cfg.disaggregation_mode == "decode",
         }
+        if is_kimi_k3:
+            unsupported |= {
+                "moe-a2a-backend": view.moe_a2a_backend not in ("none", "deepep"),
+                "enable-two-batch-overlap": cfg.enable_two_batch_overlap,
+            }
+        else:
+            unsupported |= {
+                "ep-size > 1": view.ep_size > 1,
+                "moe-a2a-backend": view.moe_a2a_backend != "none",
+            }
         if is_kimi:
             unsupported["disaggregation-mode != null"] = (
                 cfg.disaggregation_mode != "null"
@@ -114,6 +122,14 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
     for flag, enabled in unsupported.items():
         if enabled:
             raise ValueError(f"--{flag} is not supported with CP-TP group sharing.")
+    # Standard EP combines expert ownership and TP weight shards over the
+    # full CP/TP group. DeepEP resolves EP to TP later in handle_a2a_moe.
+    if is_kimi_k3 and view.moe_a2a_backend == "none":
+        if view.ep_size < 1 or cfg.tp_size % view.ep_size != 0:
+            raise ValueError(
+                "Kimi-K3 prefill CP requires --ep-size to be a positive divisor "
+                f"of --tp-size={cfg.tp_size}, got ep_size={view.ep_size}."
+            )
     # Decode sees this prefill as TP cp_size, while its sender stages by
     # attention TP 1, so the two would pick different staging layouts.
     if cfg.disaggregation_mode == "prefill" and envs.SGLANG_DISAGG_STAGING_BUFFER.get():
@@ -122,7 +138,7 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
         )
 
     linear_config = mambaish_config(model)
-    if architecture.startswith("KimiK3"):
+    if is_kimi_k3:
         prefill_backend, _ = attention_backends_of(view)
         if prefill_backend not in ("fa3", "fa4"):
             raise ValueError(

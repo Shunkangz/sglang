@@ -1126,10 +1126,17 @@ class KimiK3MoE(nn.Module):
     def _forward_cp(self, hidden_states, forward_batch, *, prefix_sum=None):
         """Keep the replicated latent down/up projections on this rank's rows.
 
-        Experts remain TP-sharded: gather their latent input and router logits
-        in rank order, then reduce-scatter before the local norm/up projection.
-        Shared experts keep their existing TP weights and use the same moves.
+        Standard TP/EP experts gather latent inputs and router logits, then
+        reduce-scatter their partials before the local norm/up projection.
+        All-to-all experts dispatch local rows and combine their complete sums.
         """
+        if self._ep_a2a:
+            # The existing EP path combines onto these source rows and handles
+            # shared-expert TP itself. Route all physical CP rows, including
+            # padding, without adding a second gather or output reduction.
+            with _every_row_routed(forward_batch, hidden_states.shape[0]):
+                return self._forward_unfused(hidden_states, prefix_sum=prefix_sum)
+
         group = get_parallel().attn_cp_group
         router_logits = self.gate(hidden_states)
         routed_local, _ = self.routed_expert_down_proj(hidden_states)

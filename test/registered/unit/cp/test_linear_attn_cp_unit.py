@@ -623,6 +623,7 @@ class TestKimiK3CPMoE(CustomTestCase):
                     moe = kimi_k3.KimiK3MoE.__new__(kimi_k3.KimiK3MoE)
                     nn.Module.__init__(moe)
                     moe.use_latent_moe = True
+                    moe._ep_a2a = False
                     moe.gate = Mock(side_effect=lambda x: x @ router)
                     moe.routed_expert_down_proj = Mock(
                         side_effect=lambda x: (x @ down, None)
@@ -692,6 +693,123 @@ class TestKimiK3CPMoE(CustomTestCase):
                         group.reduce_scatter_tensor.call_count, 2 if shared else 1
                     )
                     group.all_reduce.assert_not_called()
+
+    def test_ep_dispatches_local_rows_and_normalizes_the_combined_output(self):
+        from sglang.srt.layers.moe.utils import MoeA2ABackend
+
+        hidden = torch.arange(24, dtype=torch.float32).reshape(4, 6) / 10
+        down = torch.arange(18, dtype=torch.float32).reshape(6, 3) / 20
+        up = torch.arange(18, dtype=torch.float32).reshape(3, 6) / 30
+        router = torch.arange(24, dtype=torch.float32).reshape(6, 4) / 40
+        for rank, shared, fused_front in (
+            (rank, shared, fused)
+            for rank in range(2)
+            for shared in (False, True)
+            for fused in (False, True)
+        ):
+            with self.subTest(rank=rank, shared=shared, fused_front=fused_front):
+                local = hidden.chunk(2)[rank]
+                prefix = torch.full_like(local, 0.5)
+                batch = SimpleNamespace(
+                    attn_cp_metadata=object(),
+                    num_token_non_padded=torch.tensor(3),
+                    global_num_token_non_padded_cpu=3,
+                )
+                original_count = batch.num_token_non_padded
+                cp_group = Mock()
+                topk_output = object()
+                moe = kimi_k3.KimiK3MoE.__new__(kimi_k3.KimiK3MoE)
+                nn.Module.__init__(moe)
+                moe.use_latent_moe = moe._ep_a2a = True
+                moe.tp_size = 2
+                moe._use_mega_moe = moe._sbo_shared_overlap = False
+                moe._shared_experts_tp1 = True
+                moe._shared_experts_tp_comm = False
+                moe._can_overlap_shared_experts_npu = Mock(return_value=False)
+                moe._ep_front_overlap = Mock(return_value=None)
+                moe.gate = Mock(side_effect=lambda x: x @ router)
+                moe.routed_expert_down_proj = Mock(
+                    side_effect=lambda x: (x @ down, None)
+                )
+                moe.routed_expert_up_proj = Mock(side_effect=lambda x: (x @ up, None))
+                moe._latent_norm = Mock(side_effect=lambda x: x.square())
+                moe.shared_experts = (
+                    Mock(side_effect=lambda x: x * 7) if shared else None
+                )
+
+                def check_local_rows(value):
+                    torch.testing.assert_close(value, local)
+                    self.assertEqual(batch.num_token_non_padded.item(), len(local))
+                    self.assertEqual(batch.global_num_token_non_padded_cpu, len(local))
+
+                def front(value):
+                    check_local_rows(value)
+                    return (topk_output, value @ down) if fused_front else None
+
+                def topk(value, scores):
+                    check_local_rows(value)
+                    torch.testing.assert_close(scores, local @ router)
+                    return topk_output
+
+                def experts(value, routing):
+                    torch.testing.assert_close(value, local @ down)
+                    self.assertIs(routing, topk_output)
+                    self.assertEqual(batch.num_token_non_padded.item(), len(local))
+                    # Dispatch/combine already sums contributions from all experts.
+                    return value * 3
+
+                moe._ep_front = Mock(side_effect=front)
+                moe.topk = Mock(side_effect=topk)
+                moe.experts = Mock(side_effect=experts)
+                with (
+                    get_context().override_server_args(enable_cp_tp_group_sharing=True),
+                    get_parallel().override(attn_cp_group=cp_group),
+                    patch(_K3 + "is_cp_active", return_value=True),
+                    patch(
+                        _K3 + "get_moe_a2a_backend", return_value=MoeA2ABackend.DEEPEP
+                    ),
+                    patch(_K3 + "tensor_model_parallel_all_reduce") as all_reduce,
+                ):
+                    output = moe(local, forward_batch=batch, prefix_sum=prefix)
+
+                combined = (local @ down) * 3
+                expected = combined.square() @ up + prefix
+                if shared:
+                    expected += local * 7
+                    torch.testing.assert_close(
+                        moe.shared_experts.call_args.args[0], local
+                    )
+                torch.testing.assert_close(output, expected)
+                torch.testing.assert_close(moe._latent_norm.call_args.args[0], combined)
+                self.assertEqual(moe.gate.call_count, int(not fused_front))
+                self.assertEqual(
+                    moe.routed_expert_down_proj.call_count, int(not fused_front)
+                )
+                self.assertIs(batch.num_token_non_padded, original_count)
+                self.assertEqual(batch.global_num_token_non_padded_cpu, 3)
+                all_reduce.assert_not_called()
+                cp_group.all_gather_into_tensor.assert_not_called()
+                cp_group.reduce_scatter_tensor.assert_not_called()
+
+    def test_ep_restores_routing_metadata_when_dispatch_fails(self):
+        moe = kimi_k3.KimiK3MoE.__new__(kimi_k3.KimiK3MoE)
+        nn.Module.__init__(moe)
+        moe._ep_a2a = True
+        count = torch.tensor(3)
+        batch = SimpleNamespace(
+            num_token_non_padded=count, global_num_token_non_padded_cpu=3
+        )
+
+        def fail(*args, **kwargs):
+            self.assertEqual(batch.num_token_non_padded.item(), 2)
+            self.assertEqual(batch.global_num_token_non_padded_cpu, 2)
+            raise RuntimeError("dispatch failed")
+
+        moe._forward_unfused = Mock(side_effect=fail)
+        with self.assertRaisesRegex(RuntimeError, "dispatch failed"):
+            moe._forward_cp(torch.ones(2, 6), batch)
+        self.assertIs(batch.num_token_non_padded, count)
+        self.assertEqual(batch.global_num_token_non_padded_cpu, 3)
 
 
 class TestCPModelBoundaries(CustomTestCase):
@@ -871,6 +989,8 @@ class TestLinearAttnCPResolution(CustomTestCase):
             ({"attn_dp_size": 2}, "attn-dp-size"),
             ({"moe_dp_size": 2}, "moe-dp-size"),
             ({"dcp_size": 2}, "dcp-size"),
+            ({"ep_size": 4}, "ep-size"),
+            ({"moe_a2a_backend": "deepep"}, "moe-a2a-backend"),
             ({"tp_size": 64, "attn_cp_size": 64}, "num_heads"),
             ({"attn_cp_size": 2}, "attn-cp-size == --tp-size"),
             ({"architecture": "UnsupportedKimiLinearForCausalLM"}, "not integrated"),
@@ -880,6 +1000,46 @@ class TestLinearAttnCPResolution(CustomTestCase):
                 self.assertRaisesRegex(ValueError, message),
             ):
                 self._resolve(**overrides)
+
+    def test_k3_prefill_cp_supports_standard_ep_and_deepep(self):
+        for architecture in (
+            "KimiK3LinearForCausalLM",
+            "KimiK3ForConditionalGeneration",
+        ):
+            for backend, ep_size in (
+                ("none", 2),
+                ("none", 4),
+                ("deepep", None),
+                ("deepep", 2),
+            ):
+                with self.subTest(
+                    architecture=architecture, backend=backend, ep_size=ep_size
+                ):
+                    ep_args = {} if ep_size is None else {"ep_size": ep_size}
+                    args = self._resolve(
+                        architecture, moe_a2a_backend=backend, **ep_args
+                    )
+                    self.assertTrue(
+                        resolution_result(args, "enable_cp_tp_group_sharing")
+                    )
+                    self.assertEqual(
+                        resolution_result(args, "ep_size"),
+                        4 if backend == "deepep" else ep_size,
+                    )
+                    self.assertEqual(
+                        resolution_result(args, "moe_a2a_backend"), backend
+                    )
+
+    def test_k3_cp_deepep_shared_experts_remain_local(self):
+        architecture = "KimiK3ForConditionalGeneration"
+        args = self._resolve(
+            architecture, moe_a2a_backend="deepep", shared_experts_tp_size=1
+        )
+        self.assertEqual(resolution_result(args, "shared_experts_tp_size"), 1)
+        with self.assertRaisesRegex(ValueError, "attention TP size \\(1\\)"):
+            self._resolve(
+                architecture, moe_a2a_backend="deepep", shared_experts_tp_size=2
+            )
 
     def test_k3_fa4_requires_blackwell_absorbed_mla_geometry(self):
         platform_path = "sglang.srt.arg_groups.cp_tp_group_sharing_hook.get_platform"
@@ -970,10 +1130,15 @@ class TestLinearAttnCPResolution(CustomTestCase):
             "KimiK3ForConditionalGeneration",
         ):
             for overrides, message in (
-                ({"ep_size": 4}, "ep-size"),
+                ({"ep_size": 3}, "positive divisor"),
+                ({"ep_size": 8}, "positive divisor"),
                 ({"pp_size": 2}, "pp-size"),
-                ({"moe_a2a_backend": "deepep"}, "moe-a2a-backend"),
+                ({"moe_a2a_backend": "deepep_v2"}, "moe-a2a-backend"),
                 ({"enable_waterfill": True}, "enable-waterfill"),
+                (
+                    {"moe_a2a_backend": "deepep", "enable_two_batch_overlap": True},
+                    "enable-two-batch-overlap",
+                ),
                 ({"attention_backend": "flashinfer"}, "prefill-attention-backend fa3"),
                 (
                     {"prefill_attention_backend": "trtllm_mla"},
