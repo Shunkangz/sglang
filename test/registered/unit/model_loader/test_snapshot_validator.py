@@ -36,27 +36,22 @@ def _gemm_triton(x, *, act_scale_ue8m0):
 class _QuantMethod:
     """Stands in for a quant method, a helper object of model code."""
 
-    __snapshot_local__ = ("cache_key",)
-
     def __init__(self):
         self.weight_block_size = [128, 128]
         self.gemm = functools.partial(_gemm_deepgemm, act_scale_ue8m0=False)
         self.apply = self._apply  # a bound method: its repr carries an address
-        self.cache_key = None
 
     def _apply(self, x):
         return x
 
 
 class _Layer(nn.Module):
-    __snapshot_local__ = ("locks",)
-
     def __init__(self, *, group):
         super().__init__()
         self.weight = nn.Parameter(torch.randn(8, 4), requires_grad=False)
+        self.weight.format_ue8m0 = False  # a flag kept on the tensor, as on FP8 scales
         self.register_parameter("bias", None)
         self.register_buffer("cache", torch.arange(16.0), persistent=False)
-        self.register_buffer("locks", torch.zeros(4, dtype=torch.int32))
         # Same layout as MLA's w_kc: a transposed view of a contiguous tensor.
         self.w_kc = torch.randn(2, 4, 8).transpose(1, 2).contiguous().transpose(1, 2)
         # A second path to the buffer, as a top-k config holds the gate's bias.
@@ -108,22 +103,26 @@ class TestSnapshotFingerprint(CustomTestCase):
         module: expanding it walked sys.modules until RecursionError, and the group's
         host tensor made the batched GPU hash raise."""
         entries = fingerprint(_model(), expert_map=None)
-        self.assertEqual(
-            entries["layers.0#tp_group"], "object object types.SimpleNamespace"
-        )
+        self.assertEqual(entries["layers.0#tp_group"], "object types.SimpleNamespace")
         self.assertEqual([p for p in entries if "group." in p or "group#" in p], [])
 
-    def test_container_cycle_ends_the_walk(self):
-        """A container that holds itself must end the walk, not recurse until
-        RecursionError."""
+    def test_cycles_end_the_walk(self):
+        """A helper that refers back to itself, or a container that holds itself, must
+        end the walk instead of recursing until RecursionError."""
         model = _model()
-        cycle = []
+        method = model.layers[0].quant_method
+        method.me = method
+        cycle = [torch.ones(1)]
         cycle.append(cycle)
-        model.layers[0].quant_method.cycle = cycle
+        method.cycle = cycle
         entries = fingerprint(model, expert_map=None)
         self.assertEqual(
-            entries["layers.0.quant_method#cycle[0]"],
-            "object ref layers.0.quant_method.cycle",
+            entries["layers.0.quant_method#me"],
+            f"object {_QuantMethod.__module__}._QuantMethod",
+        )
+        self.assertEqual(
+            entries["layers.0.quant_method#cycle[1]"],
+            "list[object torch.Tensor, <cycle>]",
         )
 
     def test_tensor_entry_frames_what_the_digest_cannot_see(self):
@@ -134,6 +133,7 @@ class TestSnapshotFingerprint(CustomTestCase):
         owner = fingerprint(model, expert_map=None)
         weight, w_kc, cache = layer.weight, layer.w_kc, layer.cache
         other_class = _SubParameter(weight.data, requires_grad=False)
+        other_class.format_ue8m0 = False
         cases = [
             (
                 "other strides",
@@ -152,6 +152,12 @@ class TestSnapshotFingerprint(CustomTestCase):
                 "layers.0.weight",
                 lambda: weight.requires_grad_(True),
                 lambda: weight.requires_grad_(False),
+            ),
+            (
+                "flag on the tensor flipped",
+                "layers.0.weight#format_ue8m0",
+                lambda: setattr(weight, "format_ue8m0", True),
+                lambda: setattr(weight, "format_ue8m0", False),
             ),
             (
                 "alias copied into its own storage",
@@ -221,19 +227,6 @@ class TestSnapshotFingerprint(CustomTestCase):
         owner, here = _model(), _model()
         del here.layers[0]._parameters["bias"]
         self.assertEqual(_paths(_diff(owner, here)), ["layers.0#bias"])
-
-    def test_process_local_fields_are_left_out(self):
-        """A field valid only in its own process must be neither compared nor shipped: an
-        equal value hides a copied pointer, an unequal one fails every correct load."""
-        owner, here = _model(), _model()
-        owner.layers[0].quant_method.cache_key = (0x7F0000001000, 0)
-        here.layers[0].quant_method.cache_key = (0x7F0000002000, 0)
-        owner.layers[0].locks.fill_(1)
-        for model, value in ((owner, 1), (here, 2)):
-            scratch = torch.full((2,), value, dtype=torch.int32)
-            scratch.snapshot_local = True  # a tensor registered by another class
-            model.layers[1].scratch = scratch
-        self.assertEqual(_diff(owner, here), [])
 
     def test_live_meta_scan_finds_a_reference_no_walk_reaches(self):
         """A meta tensor that install did not replace makes custom ops do nothing (a stale
