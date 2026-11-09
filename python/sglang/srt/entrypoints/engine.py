@@ -1964,7 +1964,12 @@ def _set_envs_and_config(server_args: ServerArgs):
         # details in https://github.com/NVIDIA/nccl-tests/issues/333#issuecomment-3103636985
         if cfg.dcp_size > 1:
             os.environ["NCCL_GRAPH_MIXING_SUPPORT"] = "0"
-    os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "8"
+    # A parked transfer can stall other streams sharing its hardware queue.
+    # Preserve a larger user-provided queue count (CUDA allows up to 32).
+    connections = os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS", "")
+    os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = str(
+        max(8, int(connections)) if connections.isdigit() else 8
+    )
 
     if os.environ.get("TRTLLM_ENABLE_PDL", "1") != "0":
         # flashinfer uses this environment variable for various kernels from MoE to quant kernels

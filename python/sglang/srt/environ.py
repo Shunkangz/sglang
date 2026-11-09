@@ -645,6 +645,11 @@ class Envs:
     # Eligible single-node deployments default NCCL cuMem on and NVLS to
     # auto mode, so native NCCL can select multicast where supported.
     SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER = EnvBool(True)
+    # Split native copy-engine allgathers into bounded per-rank contributions,
+    # then pause between them for foreground NVLink collectives. One chunk's
+    # rank-major staging is reserved per pool before sizing the KV cache.
+    SGLANG_KV_SHARD_GATHER_CHUNK_MB = EnvInt(8)
+    SGLANG_ENABLE_KV_SHARD_GATHER_PAUSE = EnvBool(False)
 
     # Attention (aiter, ROCm): route NEXTN spec draft_extend (EAGLE-v2 KV
     # catch-up) through aiter unified_attention (GQA-packed + split-KV) instead

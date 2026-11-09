@@ -145,6 +145,23 @@ def _run_cross_node_mla(rank, world, port):
     assert any("nccl" in name.lower() for name in activity)
 
 
+def _run_gated_zero_sm_mla(rank, world, port):
+    from sglang.srt.distributed.device_communicators.gated_transfer import Link
+
+    # Increase the latent width so each rank's prefix exceeds the 1 MiB
+    # collective chunk, exercising compact staging and a short final chunk.
+    with unittest.mock.patch.dict(
+        _run_mla.__globals__, {"_GATHER_KV_LORA_RANK": 16384}
+    ):
+        pool, req_to_token, prefix_len, seq_len = _run_mla(rank, world, port)
+    assert pool._gather_chain.link == Link.NVLINK
+    assert pool._gather_scratch.nbytes == world * (1 << 20)
+    send_bytes = pool._send_rows.numel() * pool.kv_buffer[0][0].nbytes
+    assert send_bytes > 1 << 20, "fixture did not exercise multiple NCCL chunks"
+    activity = _gather_gpu_activity(pool, req_to_token, prefix_len, seq_len)
+    assert not any("nccl" in name.lower() for name in activity), activity
+
+
 def _run_zero_sm_allgather_comparison(rank, world, init_method):
     """Compare the pool's in-place window contract with ordinary NCCL."""
     torch.cuda.set_device(rank)
@@ -316,6 +333,27 @@ class TestPageInterleaveZeroSmGatherMultiGpu(CustomTestCase):
             mp.spawn(
                 _run_cross_node_mla,
                 args=(_GATHER_WORLD, 29811),
+                nprocs=_GATHER_WORLD,
+                join=True,
+            )
+
+    def test_gated_native_gather_preserves_prefix_layout(self):
+        self._require_patched_nccl()
+        with (
+            temp_set_env(
+                NCCL_CUMEM_ENABLE="1",
+                NCCL_CTA_POLICY=None,
+                NCCL_NVLS_ENABLE="2",
+                CUDA_DEVICE_MAX_CONNECTIONS="32",
+            ),
+            envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.override(True),
+            envs.SGLANG_ENABLE_KV_SHARD_GATHER_PAUSE.override(True),
+            envs.SGLANG_KV_SHARD_GATHER_CHUNK_MB.override(1),
+            envs.SGLANG_GATED_TRANSFER_WATCHDOG_MS.override(0),
+        ):
+            mp.spawn(
+                _run_gated_zero_sm_mla,
+                args=(_GATHER_WORLD, 29812),
                 nprocs=_GATHER_WORLD,
                 join=True,
             )

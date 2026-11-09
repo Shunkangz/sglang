@@ -40,6 +40,8 @@ Pins the pure arithmetic that rotated owner-classed allocation hangs on:
 9. HiCache host offload: the host pool striped like the device pool,
    owner-classed host slots, the per-rank narrowing of a transfer, an N-rank
    backup -> evict -> load-back round trip, and the layer-load waits.
+10. Foreground all-reduces pause in-flight background transfers after any
+    output allocation and resume them after the communication call.
 
 The real NCCL MLA/MHA/MTP gathers and symmetric buffer lifetime tests live in
 ``test_page_interleave_gather_multi_gpu.py``; the zero-SM gathers, which need
@@ -52,6 +54,7 @@ import ctypes
 import gc
 import math
 import shutil
+import threading
 import unittest
 import unittest.mock
 from array import array
@@ -64,10 +67,13 @@ from parameterized import parameterized_class
 
 from sglang.srt.disaggregation.common.conn import CommonKVSender
 from sglang.srt.disaggregation.utils import filter_kv_indices_for_shard_rank
+from sglang.srt.distributed.device_communicators import gated_transfer
+from sglang.srt.distributed.device_communicators.gated_transfer import Link
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     _release_nccl_window_buffer,
     allocate_symmetric_buffer,
 )
+from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache import page_interleave
@@ -249,6 +255,59 @@ class TestPageShardScratchSizing(CustomTestCase):
             kvc.spec_aux_config.eagle_draft_num_layers = None
             with self.assertRaisesRegex(ValueError, "EAGLE MTP"):
                 compute_page_shard_scratch_bytes(kvc, include_mtp=True)
+
+    def test_gated_gather_staging_is_reserved_once_per_pool(self):
+        for use_mla in (True, False):
+            with (
+                self.subTest(use_mla=use_mla),
+                self._fixture(
+                    use_mla=use_mla, context_len=100, shard_size=2, tp_size=2
+                ) as kvc,
+                get_context().override_server_args(enable_multi_layer_eagle=False),
+                envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.override(True),
+                envs.SGLANG_KV_SHARD_GATHER_CHUNK_MB.override(3),
+            ):
+                kvc.spec_algorithm = SpeculativeAlgorithm.EAGLE
+                kvc.spec_aux_config = SimpleNamespace(eagle_draft_num_layers=1)
+                with envs.SGLANG_ENABLE_KV_SHARD_GATHER_PAUSE.override(False):
+                    assembly_bytes = compute_page_shard_scratch_bytes(kvc)
+                # One all-rank chunk is reused across both assembly slots and
+                # every layer. A separate draft pool needs its own staging.
+                staging_bytes = 2 * (3 << 20)
+                with envs.SGLANG_ENABLE_KV_SHARD_GATHER_PAUSE.override(True):
+                    for draft_layers in (1, 3):
+                        with self.subTest(draft_layers=draft_layers):
+                            kvc.spec_aux_config.eagle_draft_num_layers = draft_layers
+                            self.assertEqual(
+                                compute_page_shard_scratch_bytes(kvc),
+                                assembly_bytes + staging_bytes,
+                            )
+                            self.assertEqual(
+                                compute_page_shard_scratch_bytes(kvc, include_mtp=True),
+                                2 * (assembly_bytes + staging_bytes),
+                            )
+
+    def test_gather_staging_requires_both_flags_and_a_positive_chunk(self):
+        for pause, zero_sm in ((False, False), (False, True), (True, False)):
+            with (
+                self.subTest(pause=pause, zero_sm=zero_sm),
+                envs.SGLANG_ENABLE_KV_SHARD_GATHER_PAUSE.override(pause),
+                envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.override(zero_sm),
+                envs.SGLANG_KV_SHARD_GATHER_CHUNK_MB.override(0),
+            ):
+                self.assertEqual(page_interleave.page_shard_gather_staging_bytes(4), 0)
+
+        with (
+            envs.SGLANG_ENABLE_KV_SHARD_GATHER_PAUSE.override(True),
+            envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.override(True),
+        ):
+            for chunk_mb in (0, -1):
+                with (
+                    self.subTest(chunk_mb=chunk_mb),
+                    envs.SGLANG_KV_SHARD_GATHER_CHUNK_MB.override(chunk_mb),
+                    self.assertRaisesRegex(ValueError, "CHUNK_MB must be positive"),
+                ):
+                    page_interleave.page_shard_gather_staging_bytes(4)
 
     def test_estimate_matches_actual_mla_and_gqa_scratch_tensors(self):
         for use_mla in (True, False):
@@ -2230,13 +2289,24 @@ class TestGatherWaitsForLayerLoad(CustomTestCase):
     def _pool(self, events, counter):
         slot = SimpleNamespace(
             tensors={"k": torch.zeros(N * PS, 1)},
-            ready=SimpleNamespace(record=lambda stream: None),
+            ready=None,
             resident_key=None,
+        )
+        current = object()
+        gather_stream = SimpleNamespace(
+            wait_stream=lambda stream: events.append(("wait_stream", stream is current))
         )
 
         def gather_pairs(local_layer):
             events.append(("gather", local_layer))
             return [(torch.zeros(4 * PS, 1), "k")]
+
+        def run(ops, *, setup, after):
+            self.assertEqual(len(ops), 1)
+            self.assertEqual(len(setup), 1)
+            self.assertIs(after, gather_stream if counter is not None else current)
+            events.append("all_gather")
+            return object()
 
         return SimpleNamespace(
             start_layer=2,
@@ -2250,14 +2320,13 @@ class TestGatherWaitsForLayerLoad(CustomTestCase):
             _send_rows=torch.arange(PS),
             _gather_send_rows=lambda name: torch.arange(PS),
             _gather_pairs=gather_pairs,
-            kv_gather_stream=SimpleNamespace(wait_stream=lambda stream: None),
+            _gather_chain=SimpleNamespace(run=run),
+            _gather_scratch=None,
+            kv_gather_stream=gather_stream,
             device_module=SimpleNamespace(
-                stream=lambda stream: nullcontext(), current_stream=lambda: None
+                stream=lambda stream: nullcontext(), current_stream=lambda: current
             ),
-            kv_gather_comm=SimpleNamespace(
-                change_state=lambda enable: nullcontext(),
-                all_gather=lambda out, inp: events.append("all_gather"),
-            ),
+            kv_gather_comm=object(),
             layer_transfer_counter=counter,
         )
 
@@ -2265,12 +2334,149 @@ class TestGatherWaitsForLayerLoad(CustomTestCase):
         events = []
         counter = SimpleNamespace(wait_until=lambda i: events.append(("wait", i)))
         PageInterleaveKVPoolMixin._prefetch_layer(self._pool(events, counter), 3)
-        self.assertEqual(events, [("wait", 1), ("gather", 1), "all_gather"])
+        self.assertEqual(
+            events, [("wait_stream", True), ("wait", 1), ("gather", 1), "all_gather"]
+        )
 
     def test_no_counter_no_wait(self):
         events = []
         PageInterleaveKVPoolMixin._prefetch_layer(self._pool(events, None), 3)
         self.assertEqual(events, [("gather", 1), "all_gather"])
+
+
+class _InFlightGate(gated_transfer._Gate):
+    """An NVLink gate with chunks in flight that records its pauses."""
+
+    def __init__(self):
+        self.link, self.device = Link.NVLINK, 0
+        self._lock = threading.Lock()
+        self._pause_stream, self._pause_thread = None, None
+        self.calls = []
+        self.pending = True
+
+    def busy(self):
+        return self.pending
+
+    def pause(self, stream):
+        self.calls.append("pause")
+
+    def resume(self, stream):
+        self.calls.append("resume")
+
+
+class TestAllReduceLeafBrackets(CustomTestCase):
+    """The large all-reduces of a sharded prefill pause an in-flight
+    background transfer around the communication call only."""
+
+    def setUp(self):
+        self.gate = _InFlightGate()
+        for owner, attr, value in (
+            (gated_transfer, "_gates", (self.gate,)),
+            (torch.cuda, "current_device", lambda: 0),
+            (torch.cuda, "current_stream", lambda device=None: "stream"),
+            (torch.cuda, "is_current_stream_capturing", lambda: False),
+        ):
+            patcher = unittest.mock.patch.object(owner, attr, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _comm(self):
+        gate = self.gate
+
+        class Comm:
+            disabled = False
+            seen = []
+
+            def all_reduce(self, tensor):
+                self.seen.append(list(gate.calls))
+
+            def outplace_all_reduce(self, tensor, out):
+                self.seen.append(list(gate.calls))
+                return out
+
+            @contextmanager
+            def change_state(self, enable=None):
+                yield
+
+        return Comm()
+
+    def test_in_place_all_reduce_pauses_around_the_call(self):
+        comm = self._comm()
+        group = SimpleNamespace(
+            pynccl_comm=comm,
+            get_available_pynccl_comm=lambda: comm,
+            torch_symm_mem_comm=None,
+        )
+        GroupCoordinator._all_reduce_in_place(group, torch.ones(4))
+        self.assertEqual(comm.seen, [["pause"]])
+        self.assertEqual(self.gate.calls, ["pause", "resume"])
+
+    def test_pynccl_out_of_place_allocates_before_the_pause(self):
+        comm = self._comm()
+        group = SimpleNamespace(
+            pynccl_comm=comm,
+            get_available_pynccl_comm=lambda: comm,
+            ca_comm=None,
+            qr_comm=None,
+            pymscclpp_comm=None,
+            torch_symm_mem_comm=None,
+        )
+        allocated_paused = []
+        real_empty_like = torch.empty_like
+
+        def empty_like(*args, **kwargs):
+            allocated_paused.append(self.gate._pause_thread is not None)
+            return real_empty_like(*args, **kwargs)
+
+        with unittest.mock.patch.object(torch, "empty_like", empty_like):
+            out = GroupCoordinator._all_reduce_out_place(group, torch.ones(4), "pynccl")
+        self.assertEqual(out.shape, (4,))
+        self.assertEqual(allocated_paused, [False])
+        self.assertEqual(comm.seen, [["pause"]])
+        self.assertEqual(self.gate.calls, ["pause", "resume"])
+
+    def test_custom_all_reduce_reserves_its_output_before_the_pause(self):
+        """Custom all-reduce allocates its output inside the call; a block of
+        that size is cached before the pause so that allocation cannot reach
+        cudaMalloc / cudaFree inside the bracket."""
+        gate = self.gate
+        seen = []
+
+        class CustomAllReduce:
+            disabled = False
+
+            def custom_all_reduce(self, tensor):
+                seen.append(list(gate.calls))
+                return tensor.clone()
+
+        group = SimpleNamespace(
+            pynccl_comm=None,
+            get_available_pynccl_comm=lambda: None,
+            ca_comm=CustomAllReduce(),
+            qr_comm=None,
+            pymscclpp_comm=None,
+            torch_symm_mem_comm=None,
+        )
+        reserved_paused = []
+        real_empty_like = torch.empty_like
+
+        def empty_like(*args, **kwargs):
+            reserved_paused.append(gate._pause_thread is not None)
+            return real_empty_like(*args, **kwargs)
+
+        with unittest.mock.patch.object(torch, "empty_like", empty_like):
+            GroupCoordinator._all_reduce_out_place(group, torch.ones(4), "ca")
+        self.assertEqual(reserved_paused, [False])
+        self.assertEqual(seen, [["pause"]])
+        self.assertEqual(gate.calls, ["pause", "resume"])
+
+        # Nothing in flight: no reservation, no pause.
+        gate.pending = False
+        gate.calls.clear()
+        with unittest.mock.patch.object(torch, "empty_like", empty_like):
+            GroupCoordinator._all_reduce_out_place(group, torch.ones(4), "ca")
+        self.assertEqual(reserved_paused, [False])
+        self.assertEqual(gate.calls, [])
 
 
 if __name__ == "__main__":

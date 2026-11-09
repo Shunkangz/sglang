@@ -974,6 +974,16 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>With <code>--enable-kv-cache-sharding</code>, register the prefix gather scratch of single-node shard groups as an NCCL symmetric window so NCCL 2.31.2+ runs the all-gather on copy engines (zero SMs). Older NCCL versions keep the SM-kernel all-gather. On single-node deployments this also makes the server set <code>NCCL_CUMEM_ENABLE=1</code> for every NCCL communicator unless it is already set, except under <code>--enable-memory-saver</code> or <code>SGLANG_MOONCAKE_CUSTOM_MEM_POOL</code>; see <code>--enable-kv-cache-sharding</code> for the full conditions. Eligible deployments also default <code>NCCL_NVLS_ENABLE=2</code> (automatic), allowing NCCL to select multicast where supported; NCCL still chooses the transport, and an explicit <code>NCCL_NVLS_ENABLE=0</code> keeps it disabled unless <code>--enable-nccl-nvls</code> or <code>--enable-symm-mem</code> overrides it. Set to <code>false</code> to keep the SM-kernel all-gather and the default <code>NCCL_CUMEM_ENABLE=0</code>.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_KV_SHARD_GATHER_CHUNK_MB</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Maximum per-rank contribution in MiB for each native NCCL all-gather when KV-shard gather pausing is enabled. Must be positive. Smaller chunks shorten the pause response at the cost of more collective calls and local copies. One staging buffer of this size times the shard-group size is reserved per KV pool before sizing the cache.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>8</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_KV_SHARD_GATHER_PAUSE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Run KV-shard prefix gathers as native NCCL all-gather chunks behind the NVLink transfer gate, pausing between chunks around foreground collectives. Requires registered single-node copy-engine scratch (NCCL 2.31.2+); otherwise the gather stays unpaused. NCCL chooses multicast or unicast. The server preserves a user-specified <code>CUDA_DEVICE_MAX_CONNECTIONS</code> above 8 to reduce sharing of hardware queues with parked transfers.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
   </tbody>
 </table>
 

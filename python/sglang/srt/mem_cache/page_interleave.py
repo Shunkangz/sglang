@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 import msgspec
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache import page_interleave_pool
 from sglang.srt.mem_cache.allocator.page_interleave import (
     PageInterleavePoolAllocator,
@@ -242,6 +243,23 @@ def make_page_shard_spec(kvc: KVCacheConfigurator) -> Optional[PageShardSpec]:
     )
 
 
+def page_shard_gather_staging_bytes(shard_size: int) -> int:
+    """Per-pool native allgather staging, reserved before sizing KV storage.
+
+    Reserve conservatively when requested: a pool that cannot register its
+    scratch falls back to an unpaused gather and leaves this reserve unused.
+    """
+    if not (
+        envs.SGLANG_ENABLE_KV_SHARD_GATHER_PAUSE.get()
+        and envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.get()
+    ):
+        return 0
+    chunk_mb = envs.SGLANG_KV_SHARD_GATHER_CHUNK_MB.get()
+    if chunk_mb <= 0:
+        raise ValueError("SGLANG_KV_SHARD_GATHER_CHUNK_MB must be positive")
+    return shard_size * (chunk_mb << 20)
+
+
 def compute_page_shard_scratch_bytes(
     kvc: KVCacheConfigurator, *, include_mtp: bool = False
 ) -> int:
@@ -258,6 +276,7 @@ def compute_page_shard_scratch_bytes(
     if spec is None:
         return 0
     scratch_bytes = 2 * spec.scratch_rows * _page_shard_row_bytes(kvc)
+    scratch_bytes += page_shard_gather_staging_bytes(spec.shard_size)
     if include_mtp:
         if (
             kvc.is_draft_worker
