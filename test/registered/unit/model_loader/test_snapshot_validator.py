@@ -12,7 +12,8 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
-from sglang.srt.model_loader import snapshot_walk
+from sglang.srt.model_loader import snapshot_walk, validator
+from sglang.srt.model_loader.snapshot_walk import all_attributes
 from sglang.srt.model_loader.validator import (
     Validator,
     compare,
@@ -64,6 +65,29 @@ class _SubParameter(nn.Parameter):
     pass
 
 
+class _Plan:
+    """A model-code object without an instance __dict__, as a msgspec struct is."""
+
+    __slots__ = ("stage",)
+
+    def __init__(self, stage):
+        self.stage = stage
+
+
+class _Communicator:
+    """A runtime object: its state differs in every process."""
+
+    def __init__(self):
+        self.buffer_address = id(self)
+
+
+_Communicator.__module__ = "sglang.srt.distributed.device_communicators.stub"
+
+
+class _Experts(list):
+    """A list subclass that also keeps an attribute of its own."""
+
+
 class _Runner:
     def run(self):
         return None
@@ -86,8 +110,20 @@ def _model(seed: int = 0) -> nn.Module:
     return model
 
 
-def _closure_over(t: torch.Tensor):
+def _closure_over(t):
     return lambda: t
+
+
+def _hook(module, args):
+    return None
+
+
+def _owner(model: nn.Module, checks: Validator) -> dict:
+    # What an owner exports after its load; checks recorded its construction.
+    return dict(
+        owner_fingerprint=fingerprint(model, expert_map=None),
+        owner_changes=checks.load_changes(model),
+    )
 
 
 def _paths(diff: list[str]) -> list[str]:
@@ -269,6 +305,109 @@ class TestSnapshotFingerprint(CustomTestCase):
         self.assertNotIn("Tensor(3, 7, 11)", live_meta_tensors())
 
 
+class TestLoadChanges(CustomTestCase):
+    def setUp(self):
+        model_code = (_QuantMethod.__module__,)
+        self.enterContext(patch.object(snapshot_walk, "MODEL_CODE", model_code))
+
+    def test_changes_the_walk_cannot_see_are_named(self):
+        """The fingerprint opens model code only, so a load that changes a config, a
+        __slots__ object, a container subclass's attribute or a module hook leaves it
+        equal; the load's changes must name exactly that value."""
+        model = _model()
+        layer = model.layers[0]
+        layer.config = types.SimpleNamespace(rope_theta=10000.0)
+        layer.plan = _Plan(stage=1)
+        layer.experts = _Experts([torch.ones(2)])
+        layer.experts.global_scale = 1.0
+        checks = Validator(cpu_group=None)
+        checks.record_construction(model)
+        walked = fingerprint(model, expert_map=None)
+        handle = []
+        cases = [
+            (
+                "config field",
+                "layers.0.config.rope_theta",
+                lambda: setattr(layer.config, "rope_theta", 1e6),
+                lambda: setattr(layer.config, "rope_theta", 10000.0),
+            ),
+            (
+                "__slots__ field",
+                "layers.0.plan.stage",
+                lambda: setattr(layer.plan, "stage", 2),
+                lambda: setattr(layer.plan, "stage", 1),
+            ),
+            (
+                "attribute of a container subclass",
+                "layers.0.experts.global_scale",
+                lambda: setattr(layer.experts, "global_scale", 2.0),
+                lambda: setattr(layer.experts, "global_scale", 1.0),
+            ),
+            (
+                "module hook",
+                "layers.0._forward_pre_hooks[0]",
+                lambda: handle.append(layer.register_forward_pre_hook(_hook)),
+                lambda: handle.pop().remove(),
+            ),
+        ]
+        for change, path, apply, revert in cases:
+            with self.subTest(change=change):
+                apply()
+                try:
+                    walked_here = fingerprint(model, expert_map=None)
+                    changes = checks.load_changes(model)
+                finally:
+                    revert()
+                self.assertEqual(compare(owner=walked, here=walked_here), [])
+                self.assertEqual(list(changes), [path])
+
+    def test_what_differs_per_process_cancels_out(self):
+        """Correct processes differ in more than tensor addresses: a checkpoint path, a
+        GPU index, the hook counter, a communicator's state. Each is the same before
+        and after a load, or MACHINERY, so two equal loads must report equal changes."""
+        loads = []
+        for gpu in (0, 1):
+            model = _model(seed=gpu)  # other tensor bytes and addresses too
+            model.config = types.SimpleNamespace(name_or_path=f"/mnt{gpu}/checkpoint")
+            model.workspace = {torch.device("cuda", gpu): "ready"}
+            model.comm = _Communicator()
+            model.layers[0].register_forward_pre_hook(_hook)
+            model.layers[0].quant_method.layer = model.layers[0]  # a cycle back
+            checks = Validator(cpu_group=None)
+            checks.record_construction(model)
+            # The load: post-processing replaces a parameter, changes a value and adds
+            # a hook, and the communicator registers a buffer.
+            model.layers[1].weight = nn.Parameter(
+                torch.empty(4, 8), requires_grad=False
+            )
+            model.layers[0].quant_method.weight_block_size = [64, 64]
+            model.layers[1].register_forward_pre_hook(_hook)
+            model.comm.buffer_address = id(model)
+            loads.append((all_attributes(model), checks.load_changes(model)))
+        (first, first_changes), (second, second_changes) = loads
+        self.assertNotEqual(compare(owner=first, here=second), [])
+        self.assertEqual(compare(owner=first_changes, here=second_changes), [])
+
+    def test_a_meta_skeleton_reads_like_the_real_build(self):
+        """A reader records its construction on a meta skeleton and ends with every
+        tensor on the device; if a tensor's text named its device, each one would be
+        a change the owner never made."""
+        real = _model()
+        with torch.device("meta"):
+            skeleton = _model()
+        self.assertEqual(
+            compare(owner=all_attributes(real), here=all_attributes(skeleton)), []
+        )
+
+    def test_keys_that_print_alike_keep_every_value(self):
+        """Two objects of one class as keys have the same text; naming the items by it
+        would keep only the last value and hide a change in the first."""
+        model = nn.Module()
+        model.by_comm = {_Communicator(): 5, _Communicator(): 2}
+        entries = all_attributes(model)
+        self.assertEqual((entries["by_comm[0]"], entries["by_comm[1]"]), ("5", "2"))
+
+
 class TestValidatorVote(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -288,21 +427,34 @@ class TestValidatorVote(CustomTestCase):
         model_code = (_QuantMethod.__module__,)
         with patch.object(snapshot_walk, "MODEL_CODE", model_code):
             model = _model()
-            owner = fingerprint(model, expert_map=None)
-            validator = Validator(cpu_group=dist.group.WORLD)
-            validator.check_after_load(
-                model=model, owner_fingerprint=owner, expert_map=None
-            )
+            checks = Validator(cpu_group=dist.group.WORLD)
+            checks.record_construction(model)
+            owner = _owner(model, checks)
+            checks.check_after_load(model=model, expert_map=None, **owner)
             model.layers[0].quant_method.weight_block_size = [64, 64]
             with self.assertRaisesRegex(
                 RuntimeError, r"layers\.0\.quant_method#weight_block_size"
             ):
-                validator.check_after_load(
-                    model=model, owner_fingerprint=owner, expert_map=None
-                )
-            validator.check_after_load(
-                model=model, owner_fingerprint=None, expert_map=None
+                checks.check_after_load(model=model, expert_map=None, **owner)
+            checks.check_after_load(
+                model=model, owner_fingerprint=None, owner_changes=None, expert_map=None
             )
+
+    def test_a_check_that_raises_still_votes(self):
+        """A rank whose check raises must refuse through the vote: if it left before
+        the barrier, the other ranks would wait 480 s and fail without the cause."""
+        model = _model()
+        checks = Validator(cpu_group=dist.group.WORLD)
+        checks.record_construction(model)
+        owner = _owner(model, checks)
+        failing = patch.object(
+            validator, "all_attributes", side_effect=ValueError("unreadable value")
+        )
+        with (
+            failing,
+            self.assertRaisesRegex(RuntimeError, r"refused[\s\S]*unreadable value"),
+        ):
+            checks.check_after_load(model=model, expert_map=None, **owner)
 
 
 if __name__ == "__main__":

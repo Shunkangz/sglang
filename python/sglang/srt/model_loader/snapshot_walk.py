@@ -1,7 +1,13 @@
-"""The walk over the state that a loaded model keeps, for weight snapshots."""
+"""Walks over the state that a loaded model keeps, for weight snapshots.
+
+walk() follows model code (modules, quant methods, MoE runners) and yields its
+tensors and values, so the fingerprint can hash tensor bytes. all_attributes() reads
+every value reachable from the model but tensor bytes, by a rule of its own.
+"""
 
 from __future__ import annotations
 
+import copyreg
 import enum
 import functools
 import numbers
@@ -21,10 +27,30 @@ MODEL_CODE = (
     "sglang.srt.hardware_backend.",
     "sglang.srt.lora.",
 )
+# Objects of these packages are the process's machinery, not model state: runtime
+# handles (streams, process groups, communicators, compiled kernels), Python's own
+# (threads, loggers, native libraries) and progress bars. A load changes them in
+# ways no install repeats, so all_attributes records them by class only.
+MACHINERY = (
+    "torch.",
+    "triton.",
+    "sglang.srt.distributed.",
+    "flashinfer.",
+    "deep_gemm.",
+    "deep_ep.",
+    "sgl_kernel.",
+    "threading.",
+    "concurrent.",
+    "logging.",
+    "ctypes.",
+    "tqdm.",
+)
 TENSOR_KINDS = ("param", "buffer", "attr")
 # Values whose repr is the value itself, with no address in it.
 _PLAIN = (numbers.Number, str, bytes, range, slice, torch.dtype)
 _MODULE_FIELDS = frozenset(vars(nn.Module()))  # training, _parameters, hooks, ...
+# Hook dicts are keyed by a process-wide counter, so only their order is compared.
+_HOOKS = frozenset(k for k in _MODULE_FIELDS if "hooks" in k)
 
 
 def walk(model: nn.Module) -> Iterator[tuple[str, str, Any]]:
@@ -47,6 +73,31 @@ def walk(model: nn.Module) -> Iterator[tuple[str, str, Any]]:
         for name, v in vars(module).items():
             if name not in _MODULE_FIELDS:
                 yield from _visit(path, name, "attr", v, walked)
+
+
+def all_attributes(model: nn.Module) -> dict[str, str]:
+    """Text of every value reachable from model, by path; a tensor by layout only.
+
+    Its rule is not walk()'s: it opens every object by Python's own state (the
+    __dict__ and __slots__ values that pickle reads), not only model code, plus all
+    containers and module hooks, so it reads the values walk() records by class
+    only. It stops at MACHINERY. A tensor is its class, dtype and shape: install
+    moves its address and device, and the fingerprint compares its bytes. A shared
+    object is expanded at every path; a cycle is cut where it returns to an object
+    on its own path.
+    """
+    entries: dict[str, str] = {}
+    stack = [("", model, frozenset())]
+    while stack:
+        path, v, above = stack.pop()
+        text, parts = _contents(v)
+        if parts and id(v) in above:
+            text, parts = f"{text} <cycle>", None
+        entries[path] = text
+        if parts:
+            inner = above | {id(v)}
+            stack += [(_join(path, k), x, inner) for k, x in parts.items()]
+    return entries
 
 
 def canonical(v: Any, _open: frozenset[int] = frozenset()) -> str:
@@ -105,6 +156,31 @@ def _parts(v: Any) -> dict[str, Any] | None:
         if any(isinstance(x, torch.Tensor) or _is_model_object(x) for x in values):
             return _items(v)
     return vars(v) if _is_model_object(v) else None
+
+
+def _contents(v: Any) -> tuple[str, dict[str, Any] | None]:
+    # Text for one value of all_attributes(), and the values it holds.
+    if isinstance(v, torch.Tensor):
+        return f"{type(v).__qualname__} {v.dtype} {tuple(v.shape)}", vars(v)
+    if isinstance(v, nn.Module):  # parameters, buffers, submodules and hooks by name
+        fields = dict(vars(v))
+        for k in _HOOKS:
+            hooks = fields.pop(k, {}).values()
+            fields.update((f"{k}[{i}]", h) for i, h in enumerate(hooks))
+        for k in ("_parameters", "_buffers", "_modules"):
+            fields.update(fields.pop(k))
+        return canonical(type(v)), fields
+    if isinstance(v, (list, tuple, dict)):  # and a subclass's own attributes
+        return type(v).__name__, {**_items(v), **getattr(v, "__dict__", {})}
+    machinery = (type(v).__module__ + ".").startswith(MACHINERY)
+    if machinery or isinstance(v, (type, types.ModuleType, enum.Enum)):
+        return canonical(v), None
+    # Python's own state, as pickle reads it: the __dict__ and the __slots__ values.
+    state = dict(getattr(v, "__dict__", {}))
+    state.update(
+        (k, getattr(v, k)) for k in copyreg._slotnames(type(v)) if hasattr(v, k)
+    )
+    return (canonical(type(v)), state) if state else (canonical(v), None)
 
 
 def _items(v: list | tuple | dict) -> dict[str, Any]:

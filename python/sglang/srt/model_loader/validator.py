@@ -1,8 +1,9 @@
-"""Validator of weight-snapshot loads: fingerprint, comparison, meta scan and vote.
+"""Validator of weight-snapshot loads: fingerprint, load changes, meta scan and vote.
 
-A snapshot reader compares fingerprint(model) with the owner's and checks that no
-meta tensor survived install; then every rank votes, so no rank serves a model
-that any rank refused. A raw load is the reference and only votes.
+A snapshot reader compares fingerprint(model) and the values its load changed with
+the owner's, and checks that no meta tensor survived install; then every rank votes,
+so no rank serves a model that any rank refused. A raw load is the reference and
+only votes.
 """
 
 from __future__ import annotations
@@ -16,7 +17,12 @@ import torch.distributed as dist
 from torch import nn
 
 from sglang.kernels.ops.memory.gpu_tensor_hash_blake3 import gpu_tensors_blake3
-from sglang.srt.model_loader.snapshot_walk import TENSOR_KINDS, canonical, walk
+from sglang.srt.model_loader.snapshot_walk import (
+    TENSOR_KINDS,
+    all_attributes,
+    canonical,
+    walk,
+)
 
 # Matches the engine's post-load barrier (UNBALANCED_MODEL_LOADING_TIMEOUT_S).
 _VOTE_TIMEOUT_S = 480
@@ -87,32 +93,54 @@ def live_meta_tensors() -> list[str]:
 
 
 class Validator:
-    """check_after_load of one load, on one rank.
+    """The checks of one load, on one rank.
 
-    Every rank of the group that builds the model together calls it in the same
+    Every rank of the group that builds the model together calls them in the same
     order, so the votes line up.
     """
 
     def __init__(self, *, cpu_group: dist.ProcessGroup) -> None:
         self.cpu_group = cpu_group
+        self.constructed: dict[str, str] = {}
+
+    def record_construction(self, model: nn.Module) -> None:
+        """Called right after the model is built: on the device for a raw load, on
+        meta for a snapshot. Paths, addresses and handles that differ per process are
+        the same before and after a load, so load_changes() leaves them out."""
+        self.constructed = all_attributes(model)
+
+    def load_changes(self, model: nn.Module) -> dict[str, str]:
+        """Every value the load changed since record_construction(), from
+        all_attributes(): a rule independent of the walk that export records with.
+        The owner exports it; a reader must make exactly the same changes."""
+        now, before = all_attributes(model), self.constructed
+        paths = before.keys() | now.keys()
+        return {p: now.get(p, "absent") for p in paths if before.get(p) != now.get(p)}
 
     def check_after_load(
         self,
         *,
         model: nn.Module,
         owner_fingerprint: dict[str, str] | None,
+        owner_changes: dict[str, str] | None,
         expert_map: torch.Tensor | None,
     ) -> None:
         """On a snapshot, compare with the owner and scan for meta tensors; then vote.
 
-        owner_fingerprint is None for a raw load, which only votes. Raises on every
-        rank if any rank refused.
+        The owner's fingerprint and load changes are None for a raw load, which only
+        votes. Raises on every rank if any rank refused.
         """
         problem = None
         if owner_fingerprint is not None:
-            here = fingerprint(model, expert_map=expert_map)
-            lines = compare(owner=owner_fingerprint, here=here)
-            lines += [f"{t}: still on meta after install" for t in live_meta_tensors()]
+            try:
+                here = fingerprint(model, expert_map=expert_map)
+                lines = compare(owner=owner_fingerprint, here=here)
+                lines += compare(owner=owner_changes, here=self.load_changes(model))
+                lines += [
+                    f"{t}: still on meta after install" for t in live_meta_tensors()
+                ]
+            except Exception as e:  # a check that fails refuses; every rank still votes
+                lines = [f"check failed: {e!r}"]
             if lines:
                 problem = f"{len(lines)} problems\n" + "\n".join(lines[:_MAX_REPORTED])
         dist.monitored_barrier(
