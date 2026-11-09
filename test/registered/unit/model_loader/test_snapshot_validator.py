@@ -64,6 +64,15 @@ class _SubParameter(nn.Parameter):
     pass
 
 
+class _Runner:
+    def run(self):
+        return None
+
+
+class _EPRunner(_Runner):
+    pass
+
+
 def _model(seed: int = 0) -> nn.Module:
     torch.manual_seed(seed)
     # A process-wide group outside model code, holding a Python module and a host
@@ -121,7 +130,7 @@ class TestSnapshotFingerprint(CustomTestCase):
             f"object {_QuantMethod.__module__}._QuantMethod",
         )
         self.assertEqual(
-            entries["layers.0.quant_method#cycle[1]"],
+            entries["layers.0.quant_method.cycle#[1]"],
             "list[object torch.Tensor, <cycle>]",
         )
 
@@ -181,6 +190,8 @@ class TestSnapshotFingerprint(CustomTestCase):
         first = _model()
         shift = torch.empty(4099)  # moves the second build's allocations
         second = _model()
+        for gpu, model in enumerate((first, second)):  # keyed by the local GPU
+            model.per_device = {torch.device("cuda", gpu): torch.zeros(2)}
         # Their helpers' reprs differ, because a repr carries addresses.
         self.assertNotEqual(
             repr(vars(first.layers[0].quant_method)),
@@ -227,6 +238,26 @@ class TestSnapshotFingerprint(CustomTestCase):
         owner, here = _model(), _model()
         del here.layers[0]._parameters["bias"]
         self.assertEqual(_paths(_diff(owner, here)), ["layers.0#bias"])
+
+    def test_canonical_keeps_values_and_drops_the_checkpoint_path(self):
+        """A PP stage's range or a rank's slice is a value; an inherited method acts on
+        its receiver, whose class counts; and transformers names a remote-code module
+        after the checkpoint's path, which differs between correct processes."""
+        first, second = types.new_class("Config"), types.new_class("Config")
+        first.__module__ = "transformers_modules.fp8.45b5eb19.configuration_deepseek"
+        second.__module__ = (
+            "transformers_modules.org.repo.c0ffee.configuration_deepseek"
+        )
+        cases = [
+            ("slice", slice(0, 4), slice(4, 8), False),
+            ("range", range(0, 2), range(2, 4), False),
+            ("inherited method", _Runner().run, _EPRunner().run, False),
+            ("remote-code class", first, second, True),
+        ]
+        for name, a, b, same in cases:
+            with self.subTest(name):
+                texts = snapshot_walk.canonical(a), snapshot_walk.canonical(b)
+                self.assertEqual(texts[0] == texts[1], same, texts)
 
     def test_live_meta_scan_finds_a_reference_no_walk_reaches(self):
         """A meta tensor that install did not replace makes custom ops do nothing (a stale
