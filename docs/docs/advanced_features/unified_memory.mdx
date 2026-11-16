@@ -119,12 +119,12 @@ A prompt that cannot fit even an otherwise empty arena is aborted at admission w
 | Pipeline parallelism | Runs without PD disaggregation. Each stage sizes its own arena, and the stages agree on the minimum of their concurrency limits. At startup they exchange their arena geometry; each stage then answers every capacity question from every stage's geometry and the request state they share, so all stages make the same decisions. Every stage needs a full-attention layer, which owns the virtual ids, and all stages must plan the same sub-pools on the same page size: a layer partition that leaves a stage without full-attention layers, or with a layer kind or window length another stage lacks, is refused. `--enable-streaming-session` and `--enable-session-radix-cache` are refused too: each stage closes timed-out sessions on its own clock, so the memory the stages hold could differ. See [Known limitations](#known-limitations). |
 | Decode context parallelism (`--dcp-size` above 1) | MLA models only (for example Kimi Linear), no sliding-window layers, no PD disaggregation, and attention backends `flashinfer`, `trtllm_mla` or `cutedsl_mla`. With speculative decoding, the backend that runs target verification must be `cutedsl_mla`: the decode backend with `--speculative-attention-mode decode`, otherwise the prefill backend. With `DSPARK` or `DFLASH`, `flashinfer` is refused. |
 | Data-parallel attention | Each attention-DP rank has its own arena. |
+| KV cache sharding (`--enable-kv-cache-sharding`) | PD prefill nodes of MLA models with recurrent-state layers (for example Kimi Linear) under plain TP, with `--page-size 64` and the `fa3` or `trtllm_mla` prefill backend. The MLA sub-pool is sharded by logical page across attention TP: each rank stores only the pages it owns, and every rank answers capacity questions from the page counts all ranks share, so the ranks decide alike without talking to each other. Refused with sparse (DSA) attention, a sliding-window sub-pool, context or pipeline parallelism, speculative decoding, HiCache, `--enable-deterministic-inference`, `--disable-chunked-prefix-cache`, `--enable-pd-role-switch` and `--disaggregation-enable-kv-checksum`. |
 
 Refused at startup:
 
 - `--enable-two-batch-overlap`
 - `--enable-lmcache`, `--enable-unified-cache-external-linker`
-- `--enable-kv-cache-sharding`
 - `--enable-int8-mamba-checkpoint`
 - `--enable-prefill-weight-versions`
 - FP4 KV cache (`--kv-cache-dtype nvfp4` or `fp4_mx_block16`)

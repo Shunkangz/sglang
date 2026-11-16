@@ -33,6 +33,7 @@ from sglang.srt.mem_cache.kv.layout.mla import (
     MLASubPoolSpec,
     MLAView,
 )
+from sglang.srt.mem_cache.kv.layout.mla_shard import ShardedMLAView
 from sglang.srt.mem_cache.kv.layout.state import NGramView, ShortConvView, StateView
 from sglang.srt.mem_cache.kv.memory.arena import GB, KVArena, plan_bands
 from sglang.srt.mem_cache.kv.memory.fixed import FixedMemory
@@ -87,6 +88,10 @@ class UnifiedBuildContext(msgspec.Struct, frozen=True, kw_only=True):
     decode_pre_alloc_size: int = 0
     # Logged only: the state share governs the total budget, not the split.
     mamba_full_memory_ratio: Optional[float] = None
+    # Logical-page KV sharding of the owner sub-pool: this rank's
+    # `PageShardSpec` and the group the cached prefix is gathered over.
+    kv_shard_spec: Optional[Any] = None
+    kv_shard_group: Optional[Any] = None
 
 
 def _log_banner(*lines) -> None:
@@ -194,8 +199,10 @@ def _build_token_view(
         kv = sub_pool.part(KV_PART)
         return _unit_view(kv, sub_pool, arena, plan)
     if isinstance(sub_pool.spec, MLASubPoolSpec):
+        # Sharded by logical page, the owner's view reads a gathered prefix.
+        sharded = ctx.kv_shard_group is not None and sub_pool is plan.owner()
         # Addressed by the 0..N-1 index of its layers, so start_layer stays 0.
-        return MLAView(
+        return (ShardedMLAView if sharded else MLAView)(
             arena=arena,
             spec=sub_pool.spec,
             kv_cache_dtype=sub_pool.geometry.kv_cache_dtype,
@@ -371,8 +378,16 @@ def build_kv_storage(
         lazy_compaction=ctx.lazy_compaction,
         full_cap_tokens=sized.full_cap_tokens,
         request_rows=sized.request_rows,
+        kv_shard_spec=ctx.kv_shard_spec,
         **legacy_capacities,
     )
+    if ctx.kv_shard_group is not None:
+        if not isinstance(views[owner.name], ShardedMLAView):
+            raise ValueError("KV sharding of unified memory needs a plain MLA owner")
+        # The gather sends this rank's pages from where its band placed them.
+        views[owner.name].bind_shard(
+            allocator.kv_shard, ctx.kv_shard_spec, ctx.kv_shard_group
+        )
     if window is None:
         # Host storage is sized from the configured token cap, not the
         # buffer's dynamic share.

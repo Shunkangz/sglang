@@ -14,6 +14,7 @@ from sglang.srt.arg_groups.model_override_base import (
     use_mla_backend,
 )
 from sglang.srt.arg_groups.overrides import declare_resolution
+from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
     get_dsa_index_kpool,
     get_dsa_index_kpool_compress,
@@ -115,6 +116,41 @@ def validate_kv_shard_attention_backend(server_args: Any, cfg: Any = None) -> No
         raise ValueError("KV sharding with trtllm_mla requires chunked prefix caching.")
 
 
+def validate_kv_shard_unified_memory(server_args: Any, cfg: Any) -> None:
+    """Unified memory shards only the MLA sub-pool of an MLA plus recurrent-state
+    model across attention TP, read by chunked-prefix MHA; refuse the rest."""
+    model_config = model_config_of(server_args)
+    prefill_backend, _ = attention_backends_of(resolved_view(server_args))
+    unsupported = {
+        "a model without both MLA attention and recurrent-state layers": (
+            not use_mla_backend(server_args) or mambaish_config(model_config) is None
+        ),
+        "sparse (DSA) attention": is_deepseek_dsa(model_config.hf_config),
+        "a sliding-window sub-pool": model_config.is_hybrid_swa,
+        "context parallelism": cfg.enable_prefill_cp or cfg.attn_cp_size > 1,
+        "pipeline parallelism": cfg.pp_size > 1,
+        "a page size other than 64": cfg.page_size != 64,
+        "a transfer backend other than mooncake": (
+            cfg.disaggregation_transfer_backend != "mooncake"
+        ),
+        "speculative decoding": cfg.speculative_algorithm is not None,
+        "HiCache": cfg.enable_hierarchical_cache,
+        "--enable-deterministic-inference": cfg.enable_deterministic_inference,
+        "--disable-chunked-prefix-cache": cfg.disable_chunked_prefix_cache,
+        "--enable-pd-role-switch": cfg.enable_pd_role_switch,
+        "--disaggregation-enable-kv-checksum": cfg.disaggregation_enable_kv_checksum,
+        "a prefill attention backend other than fa3 or trtllm_mla": (
+            prefill_backend not in ("fa3", "trtllm_mla")
+        ),
+    }
+    refused = [what for what, hit in unsupported.items() if hit]
+    if refused:
+        raise ValueError(
+            "--enable-kv-cache-sharding with --enable-unified-memory does not "
+            "support: " + "; ".join(refused)
+        )
+
+
 def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) -> None:
     """Validate KV sharding and declare its derived eager-prefill settings."""
     cfg = resolving_view(server_args)
@@ -194,10 +230,7 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
             "FlexKV load-back allocates through the stock flat allocator API."
         )
     if cfg.enable_unified_memory:
-        raise ValueError(
-            "--enable-kv-cache-sharding does not support --enable-unified-memory: "
-            "the unified pool uses a different virtual-id allocator and layout."
-        )
+        validate_kv_shard_unified_memory(server_args, cfg)
     if cfg.dcp_size > 1:
         raise ValueError(
             "--enable-kv-cache-sharding and decode context parallelism "

@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.mem_cache.kv.routed_cache import RoutedKVCache
 from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
 
 if TYPE_CHECKING:
@@ -33,6 +34,9 @@ if TYPE_CHECKING:
 
 def get_kv_shard_pool(token_to_kv_pool) -> Optional[PageInterleaveKVPoolMixin]:
     """Return the page-interleaved pool, if logical-page sharding is active."""
+    if isinstance(token_to_kv_pool, RoutedKVCache):
+        # A sharded unified pool keeps its token KV in one view: the owner's.
+        token_to_kv_pool = token_to_kv_pool.layer_router.wrapped_view()
     return (
         token_to_kv_pool
         if isinstance(token_to_kv_pool, PageInterleaveKVPoolMixin)

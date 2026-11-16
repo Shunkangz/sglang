@@ -1929,7 +1929,9 @@ class TestShardSendFilter(CustomTestCase):
         pages = np.array(_chain_pages(base=0, n_pages=4), dtype=np.int64)
         for rank, expect_skip in ((3, [True, False]), (1, [False, False])):
             sender = SimpleNamespace(
-                kv_mgr=SimpleNamespace(kv_shard_rank=rank, kv_shard_size=N),
+                kv_mgr=SimpleNamespace(
+                    kv_shard_rank=rank, kv_shard_size=N, kv_shard_rank_local=False
+                ),
                 curr_idx=0,
                 num_kv_indices=len(pages),
             )

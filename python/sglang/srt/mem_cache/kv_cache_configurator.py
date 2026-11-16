@@ -88,6 +88,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.page_interleave import (
     PageShardSpec,
+    compute_page_shard_scratch_bytes,
     get_kv_shard_group,
     get_shared_kv_shard_pool,
     make_page_shard_spec,
@@ -1252,6 +1253,8 @@ class KVCacheConfigurator:
                 disable_overlap_schedule=get_schedule().disable_overlap_schedule,
                 decode_pre_alloc_size=decode_pre_alloc_size,
                 mamba_full_memory_ratio=get_schedule().mamba_full_memory_ratio,
+                kv_shard_spec=self.kv_shard_spec,
+                kv_shard_group=self.kv_shard_group,
             ),
         )
         return storage
@@ -3468,6 +3471,11 @@ class KVCacheConfigurator:
             radix_cache=not get_memory().disable_radix_cache,
             window_ratio=schedule.swa_full_tokens_ratio,
             floor_window=self.model_config.sliding_window_size if has_window else None,
+            kv_shard_scratch_bytes=(
+                compute_page_shard_scratch_bytes(self)
+                if get_parallel().enable_kv_cache_sharding
+                else 0
+            ),
         )
         frozen = self._unified_sized if cap_tokens is not None else None
         if frozen is not None:

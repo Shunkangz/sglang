@@ -1380,9 +1380,12 @@ class FlashAttentionBackend(AttentionBackend):
             self.req_to_token,
             forward_batch,
         ):
-            metadata.page_table = self._kv_shard_pool.translate_loc_to_scratch(
-                metadata.page_table
-            ).to(torch.int32)
+            # A unified pool's sharded view serves the chunked-prefix read
+            # only, by logical id: no page table reads the scratch.
+            if not _unified_read:
+                metadata.page_table = self._kv_shard_pool.translate_loc_to_scratch(
+                    metadata.page_table
+                ).to(torch.int32)
 
         # Convert the page table to a strided format which is needed by FA3 API
         if self.page_size > 1 and not _unified_read:

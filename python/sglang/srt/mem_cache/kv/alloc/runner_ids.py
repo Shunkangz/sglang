@@ -228,6 +228,8 @@ class RunnerIds:
         # keyed by sub-pool name only.
         self._role_sub_pools: Dict[str, str] = {}
         self._call_spaces: Optional[Dict[str, IdSpace]] = None
+        # A unified pool's sharded owner (`kv_shard.ShardedOwner`), else None.
+        self.kv_shard = None
         if self.is_translating:
             if is_cp_sharded_padded():
                 # Translated ids skip the sharded projection and rank filter below.
@@ -255,6 +257,7 @@ class RunnerIds:
                 self._role_sub_pools[IdSpaceKind.SLIDING_WINDOW] = window.name
             self._capture_page_size = alloc.page_size
             self._translate_full = alloc.translate_kv_loc
+            self.kv_shard = alloc.kv_shard
             # DCP read ids stay WIDENED to the consumer: selecting this rank's
             # share changes the length, so only the production site can do it.
             self.defer_read_translate = get_parallel().attn_dcp_size > 1
@@ -263,7 +266,9 @@ class RunnerIds:
             # draft reads the ones its own pool routes layers to.
             alloc_spaces = alloc.id_spaces(defer_reads=self.defer_read_translate)
             self._capture_token_capacity = (
-                alloc_spaces[IdSpaceKind.FULL].table.numel() * alloc.page_size
+                self.kv_shard.token_id_space
+                if self.kv_shard is not None
+                else alloc_spaces[IdSpaceKind.FULL].table.numel() * alloc.page_size
             )
             # A fused draft's write ids are the owner's virtual ids, whichever
             # sub-pools its layers read.
@@ -888,6 +893,7 @@ class RunnerIds:
         dcp_size = get_parallel().attn_dcp_size
         if dcp_size > 1:
             widened_ids = widened_ids // dcp_size
-        if not self.is_translating:
+        if not self.is_translating or self.kv_shard is not None:
+            # A sharded owner's read ids stay logical for the gather scratch.
             return widened_ids
         return self._translate_full(widened_ids)

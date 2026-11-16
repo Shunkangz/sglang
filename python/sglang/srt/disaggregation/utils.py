@@ -1140,9 +1140,14 @@ def filter_kv_indices_for_shard_rank(
     index_slice: slice,
     shard_rank: int,
     shard_size: int,
+    rank_local: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Logical page l lives on rank l % N as local page l // N; returns the owned
     local ids and their send positions, which replace the contiguous index_slice."""
+    if rank_local:
+        # A unified pool already translated the ids: 0 (the sink) is a peer's page.
+        owned = np.flatnonzero(kv_indices)
+        return kv_indices[owned], owned + index_slice.start
     owned = kv_indices % shard_size == shard_rank
     positions = np.arange(index_slice.start, index_slice.stop, dtype=np.int64)
     return kv_indices[owned] // shard_size, positions[owned]
