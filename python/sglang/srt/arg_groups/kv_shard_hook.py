@@ -48,6 +48,7 @@ def register_kv_shard_transfer_backend(name: str) -> None:
 # HiCache storage backends whose reads and writes cover only each shard rank's
 # own pages. None upstream.
 _KV_SHARD_STORAGE_BACKENDS: set = set()
+KV_SHARD_BUILTIN_STORAGE_BACKENDS = ("mooncake", "file")
 
 
 def register_kv_shard_storage_backend(name: str) -> None:
@@ -134,10 +135,10 @@ def check_kv_shard_storage(
     key_scheme: str,
 ) -> None:
     """Validate built-in storage at launch and again at runtime attach."""
-    if storage_backend != "mooncake":
+    if storage_backend not in KV_SHARD_BUILTIN_STORAGE_BACKENDS:
         raise ValueError(
-            "--enable-kv-cache-sharding supports only the mooncake "
-            f"built-in HiCache storage backend, got {storage_backend!r}."
+            "--enable-kv-cache-sharding supports only the mooncake and file "
+            f"built-in HiCache storage backends, got {storage_backend!r}."
         )
     if host_memory_mode != "cache":
         raise ValueError(
@@ -147,7 +148,7 @@ def check_kv_shard_storage(
     if key_scheme != "rank-suffix":
         raise ValueError(
             "--enable-kv-cache-sharding requires --hicache-storage-key-scheme "
-            "rank-suffix with Mooncake storage."
+            "rank-suffix with built-in storage."
         )
 
 

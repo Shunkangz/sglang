@@ -54,7 +54,7 @@ class HiCacheStorageConfig:
 
     # Whole-page replication can differ from the target's attention layout.
     rank_replicated: Optional[bool] = None
-    # Sharded Mooncake keys name the head shard, while tp_rank still identifies
+    # Sharded storage keys name the head shard, while tp_rank still identifies
     # the process that owns the relevant buffers.
     key_tp_rank: Optional[int] = None
 
@@ -883,6 +883,13 @@ class HiCacheFile(HiCacheStorage):
         shard_suffix = ""
         if storage_config.pp_size > 1:
             shard_suffix += f"_{storage_config.pp_size}_{storage_config.pp_rank}"
+        if storage_config.key_tp_rank is not None:
+            # A page can change owners. The model namespace already includes
+            # attention TP size, so only nonreplicated KV needs a head rank.
+            if not storage_config.is_rank_replicated:
+                shard_suffix += f"_head{storage_config.key_tp_rank}"
+            self.config_suffix = self.tp_config_suffix = f"_{model_name}{shard_suffix}"
+            return
         # Under NSA context parallel each CP rank holds a disjoint slice of
         # every page, so give each rank its own file key to avoid a cross-rank
         # write race.
@@ -926,7 +933,7 @@ class HiCacheFile(HiCacheStorage):
         attn_cp_rank = storage_config.attn_cp_rank
 
         if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:
-            os.makedirs(self.file_path)
+            os.makedirs(self.file_path, exist_ok=True)
             logger.info(f"Created HiCacheFile storage directory at {self.file_path}")
 
         # Metadata cache positive lookup toggle & TTL
@@ -973,6 +980,7 @@ class HiCacheFile(HiCacheStorage):
             self.file_path,
             owned_suffixes=owned_suffixes,
             tp_rank=tp_rank,
+            allow_eviction=storage_config.key_tp_rank is None,
             extra_config=storage_config.extra_config,
             on_evict=(
                 self.metadata_cache.remove if self.metadata_cache is not None else None

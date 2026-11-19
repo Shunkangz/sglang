@@ -40,6 +40,7 @@ if TYPE_CHECKING:
 
 from sglang.srt.arg_groups.hicache_hook import UNIFIED_KEY_SCHEME_STORAGE_BACKENDS
 from sglang.srt.arg_groups.kv_shard_hook import (
+    KV_SHARD_BUILTIN_STORAGE_BACKENDS,
     check_kv_shard_storage,
     kv_shard_storage_backend_supported,
 )
@@ -803,7 +804,10 @@ class HiCacheController:
                 raise ValueError(
                     "--enable-kv-cache-sharding does not support tp_lcm_size (split heads)."
                 )
-            if self.storage_host_pool.layout == "layer_first":
+            if (
+                storage_backend == "mooncake"
+                and self.storage_host_pool.layout == "layer_first"
+            ):
                 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 
                 if isinstance(self.storage_host_pool.host_pool, MHATokenToKVPoolHost):
@@ -1038,8 +1042,8 @@ class HiCacheController:
         host_pool = self.storage_host_pool
         shard_storage_io = (
             isinstance(host_pool, PageInterleaveHostPool)
-            and self.storage_backend_type == "mooncake"
-            and not kv_shard_storage_backend_supported("mooncake")
+            and self.storage_backend_type in KV_SHARD_BUILTIN_STORAGE_BACKENDS
+            and not kv_shard_storage_backend_supported(self.storage_backend_type)
         )
         # Token KV views carry the server's resolved logical dtype, including
         # FP8 variants that share a uint8 backing buffer.

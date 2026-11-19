@@ -79,9 +79,9 @@ Guidelines:
 - For MHA models with Mooncake and `page_head` layout, HiCache will split head shards based on `tp_lcm_size` to make keys reusable across heterogeneous TP deployments.
 - If all clusters use the same TP size, this option is not needed.
 
-### KV cache sharding with Mooncake
+### KV cache sharding with L3 storage
 
-On NVIDIA CUDA PD prefill workers, you can combine KV cache sharding with HiCache host offload and Mooncake storage. Configure your model and parallelism for KV sharding first: plain TP for MLA, or prefill attention CP for GQA. KV sharding requires the Python UnifiedTreeCore: leave `SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND` unset so that sharding selects it, or set it to `python`. Set up Mooncake as described in [Deployment with Mooncake](#deployment-with-mooncake), but use `--hicache-io-backend kernel` and `--hicache-mem-layout page_first` instead of that example's I/O flags. Then add these flags to your prefill server:
+On NVIDIA CUDA PD prefill workers, you can combine KV cache sharding with HiCache host offload and Mooncake or File storage. Configure your model and parallelism for KV sharding first: plain TP for MLA, or prefill attention CP for GQA. KV sharding requires the Python UnifiedTreeCore: leave `SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND` unset so that sharding selects it, or set it to `python`. Set up Mooncake as described in [Deployment with Mooncake](#deployment-with-mooncake), but use `--hicache-io-backend kernel` and `--hicache-mem-layout page_first` instead of that example's I/O flags. Then add these flags to your prefill server:
 
 ```bash Command
 --enable-kv-cache-sharding \
@@ -98,9 +98,11 @@ Sharded writers use a separate namespace from unsharded writers. Decode workers 
 
 The following restrictions also apply to runtime storage attachment:
 
-- Use the Mooncake backend with `cache` host memory mode and the default `rank-suffix` storage key scheme.
+- Use `cache` host memory mode and the default `rank-suffix` storage key scheme with either backend.
 - Use a single KV host pool. DSA indexer pools and other sidecar pools require separate storage support.
 - Omit `tp_lcm_size` to keep each attention rank's head partition intact.
+
+For File storage, use `--hicache-storage-backend file` and set `file_storage_path` in the storage extra config to a directory shared by all shard ranks. Leave both eviction limits (`max_size` and `min_free_space`) disabled in the extra config and environment.
 
 ### Prefetch Policies
 

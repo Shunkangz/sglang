@@ -55,6 +55,7 @@ import ctypes
 import gc
 import math
 import shutil
+import tempfile
 import threading
 import unittest
 import unittest.mock
@@ -2391,7 +2392,7 @@ class TestShardedStorageAttach(CustomTestCase):
 
     def test_attach_rejects_unsupported_storage_before_creating_a_backend(self):
         for backend, controller_args, attach_args in (
-            ("file", (), {}),
+            ("fast_file", (), {}),
             ("mooncake", ("buffer_only",), {}),
             ("mooncake", (), {"key_scheme": "unified"}),
             ("mooncake", (), {"extra_config": {"tp_lcm_size": 8}}),
@@ -2413,6 +2414,42 @@ class TestShardedStorageAttach(CustomTestCase):
                     **attach_args,
                 )
             create_backend.assert_not_called()
+
+    def test_file_reads_pages_after_owner_rotation(self):
+        controllers = [self._controller(rank) for rank in range(N)]
+        keys = [f"page-{index}" for index in range(N)]
+        operation = SimpleNamespace(request_id="test", is_terminated=lambda: False)
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.override(directory),
+        ):
+            expected = []
+            for rank, controller in enumerate(controllers):
+                self._attach(
+                    controller,
+                    storage_backend="file",
+                    cp_rank=rank,
+                    cp_size=N,
+                    attn_tp_size=1,
+                    extra_config={"max_size": 0, "min_free_space": 0},
+                )
+                pool = controller.storage_host_pool
+                source = pool.alloc(N * PS, start_owner=0)
+                row = pool.placement.local_index(source[rank * PS])
+                page = torch.full_like(pool.get_dummy_flat_data_page(), rank + 1)
+                pool.set_from_flat_data_page(row, page)
+                self.assertTrue(controller.page_set_func(keys, source))
+                pool.free(source)
+                pool.kv_buffer.zero_()
+                expected.append(page)
+
+            for rank, controller in enumerate(controllers):
+                pool = controller.storage_host_pool
+                target = pool.alloc(N * PS, start_owner=1)
+                self.assertEqual(controller.page_get_func(operation, keys, target), N)
+                position = (rank - 1) % N
+                row = pool.placement.local_index(target[position * PS])
+                torch.testing.assert_close(pool.get_data_page(row), expected[position])
 
     def test_attach_rejects_sidecars_before_creating_a_backend(self):
         with (

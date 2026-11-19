@@ -4896,7 +4896,7 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
             handle_kv_cache_sharding(args)
 
     def test_hicache_storage_allowlist(self):
-        for backend in (None, "mooncake"):
+        for backend in (None, "mooncake", "file"):
             with self.subTest(backend=backend):
                 args = self._rounding_args(
                     raw_mem_fraction=0.8, resolved_mem_fraction=0.8
@@ -4915,7 +4915,7 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
             ),
         )
         for overrides, error in (
-            ({"hicache_storage_backend": "file"}, "only the mooncake"),
+            ({"hicache_storage_backend": "fast_file"}, "fast_file"),
             (
                 {
                     "hicache_storage_backend": "mooncake",
