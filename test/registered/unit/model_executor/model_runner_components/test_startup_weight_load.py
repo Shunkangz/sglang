@@ -20,12 +20,13 @@ from sglang.test.test_utils import (
 maybe_stub_sgl_kernel()
 
 from sglang.srt.configs.device_config import DeviceConfig
-from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+from sglang.srt.configs.load_config import _DEFAULT_LOAD_GROUP, LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import ModelImpl
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.cuda_graph_config import Backend, CudaGraphConfig
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.model_executor.model_runner_components import load_model_utils
 from sglang.srt.model_executor.model_runner_components.startup_weight_load import (
     ModelStorageManifest,
     StartupWeightLoadManager,
@@ -33,8 +34,9 @@ from sglang.srt.model_executor.model_runner_components.startup_weight_load impor
     StartupWeightLoadState,
 )
 from sglang.srt.model_loader.loader import DefaultModelLoader
+from sglang.srt.model_loader.snapshot.coordinator import Ballot
 from sglang.srt.model_loader.weight_utils import initialize_capture_safe_weights
-from sglang.srt.runtime_context import get_context, publish, reset_context
+from sglang.srt.runtime_context import get_exec, get_parallel, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -668,39 +670,53 @@ class _RunnerStartupManager:
 
 class TestModelRunnerStartupWeightLoadOwnership(CustomTestCase):
     def setUp(self):
-        # The code under test reads its config and its rank from the context.
         enter_scope(self, published_topology())
 
     @staticmethod
     def _runner(manager):
         runner = ModelRunner.__new__(ModelRunner)
         runner.startup_weight_load = manager
-        runner.server_args = SimpleNamespace(
-            elastic_ep_backend=None,
-            is_ep_joiner=False,
-        )
+        runner.load_group = _DEFAULT_LOAD_GROUP
         return runner
 
-    def test_success_releases_ownership_after_the_barrier(self):
+    def test_success_releases_ownership_after_the_vote(self):
         trace = []
         manager = _RunnerStartupManager(trace)
         runner = self._runner(manager)
+        tp_group = object()
 
-        def barrier(**kwargs):
+        def record_vote(*, group, ballot):
+            self.assertIs(group, tp_group)
+            self.assertEqual(ballot, Ballot())
             self.assertIs(runner.startup_weight_load, manager)
-            trace.append("barrier")
+            trace.append("vote")
 
         with (
-            patch(
-                "sglang.srt.model_executor.model_runner.dist_barrier_after_load",
-                side_effect=barrier,
-            ),
-            get_context().override_server_args(),
+            patch.object(load_model_utils, "vote", side_effect=record_vote),
+            get_parallel().override(tp_group=tp_group),
         ):
             runner.finalize_startup_weight_load()
 
-        self.assertEqual(trace, ["finalize", "barrier"])
+        self.assertEqual(trace, ["finalize", "vote"])
         self.assertIsNone(runner.startup_weight_load)
+
+    def test_mooncake_joiner_skips_the_vote(self):
+        runner = self._runner(Mock())
+        with (
+            patch.object(load_model_utils, "vote") as vote,
+            get_exec().moe.override(elastic_ep_backend="mooncake", is_ep_joiner=True),
+        ):
+            runner.finalize_startup_weight_load()
+        vote.assert_not_called()
+
+    def test_explicit_stage_group_survives_a_draft_topology_override(self):
+        stage_group = object()
+        with (
+            patch.object(load_model_utils, "vote") as vote,
+            get_parallel().override(tp_group=object()),
+        ):
+            load_model_utils.vote_after_load(load_group=stage_group)
+        vote.assert_called_once_with(group=stage_group, ballot=Ballot())
 
 
 class _SchedulerWorker:

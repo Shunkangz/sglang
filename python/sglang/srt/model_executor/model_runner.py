@@ -172,7 +172,6 @@ from sglang.srt.model_executor.model_runner_components.layer_setup import (
 )
 from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     build_load_config,
-    dist_barrier_after_load,
     load_kv_cache_scales,
     load_model_with_memory_saver,
     maybe_downgrade_dtype_for_legacy_gpu,
@@ -183,6 +182,7 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     report_online_quantization,
     reserve_rope_cache_for_long_sequences,
     resolve_sliding_window_size,
+    vote_after_load,
 )
 from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
     check_quantized_moe_compatibility,
@@ -1515,34 +1515,17 @@ class ModelRunner:
         )
 
         if self.startup_weight_load is None:
-            dist_barrier_after_load(
-                elastic_ep_backend=get_exec().moe.elastic_ep_backend,
-                tp_rank=get_parallel().tp_rank,
-                is_ep_joiner=get_exec().moe.is_ep_joiner,
-            )
+            vote_after_load(load_group=self.load_group)
 
     def start_startup_weight_load(self) -> None:
         assert self.startup_weight_load is not None
         self.startup_weight_load.start_prefetch()
 
     def finalize_startup_weight_load(self) -> None:
-        """Commit the real weights, then run the post-load barrier.
-
-        The barrier moves here because ``load_model`` returns with sentinel
-        values under overlap, so this is the first point at which "weights are
-        loaded" is true for this rank. It follows the commit and its validation
-        deliberately: a rank that fails to commit must not report readiness. A
-        commit failure is terminal for the process, so peer ranks observe it as
-        a barrier timeout rather than a clean collective abort, which matches
-        the existing startup contract for load failures.
-        """
+        """Vote after the prefetched weights have replaced the sentinels and passed validation."""
         assert self.startup_weight_load is not None
         self.startup_weight_load.finalize()
-        dist_barrier_after_load(
-            elastic_ep_backend=get_exec().moe.elastic_ep_backend,
-            tp_rank=get_parallel().tp_rank,
-            is_ep_joiner=get_exec().moe.is_ep_joiner,
-        )
+        vote_after_load(load_group=self.load_group)
         self.startup_weight_load = None
 
     def maybe_precompile_model_kernels_after_loading(self) -> None:

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import datetime
 import logging
 import os
 import socket
@@ -9,7 +8,6 @@ from typing import TYPE_CHECKING, Any
 
 import msgspec
 import torch
-import torch.distributed as dist
 
 from sglang.srt.arg_groups.overrides import (
     modelexpress_transport_of,
@@ -33,6 +31,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
     trigger_init_weights_send_group_for_remote_instance_request,
 )
+from sglang.srt.model_loader.snapshot.coordinator import Ballot, vote
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_context,
@@ -53,9 +52,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
-
-
-UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
 
 
 def reserve_rope_cache_for_long_sequences(model, model_config, logger=None):
@@ -465,25 +461,17 @@ def load_model_with_memory_saver(
     )
 
 
-def dist_barrier_after_load(
-    *,
-    elastic_ep_backend: str | None,
-    tp_rank: int,
-    is_ep_joiner: bool = False,
-) -> None:
-    if elastic_ep_backend == "mooncake":
-        # Mooncake does not support `monitored_barrier`
-        if not is_ep_joiner:
-            dist.barrier(group=get_parallel().tp_group.cpu_group)
-    else:
-        # Handle the case where some ranks do not finish loading.
-        try:
-            dist.monitored_barrier(
-                group=get_parallel().tp_group.cpu_group,
-                timeout=datetime.timedelta(seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S),
-                wait_all_ranks=True,
-            )
-        except RuntimeError:
-            raise ValueError(
-                f"TP rank {tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
-            ) from None
+def vote_after_load(*, load_group: LoadGroup) -> None:
+    moe = get_exec().moe
+    if moe.elastic_ep_backend == "mooncake" and moe.is_ep_joiner:
+        # The serving ranks are already past startup and cannot join this vote.
+        return
+    # PP draft workers receive their stage's group before entering the draft
+    # topology. Otherwise keep the TP group used by the post-load barrier,
+    # including when the loader itself uses no collectives (load_group=None).
+    group = (
+        get_parallel().tp_group
+        if load_group is _DEFAULT_LOAD_GROUP or load_group is None
+        else load_group
+    )
+    vote(group=group, ballot=Ballot())
