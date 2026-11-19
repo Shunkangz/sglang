@@ -8,7 +8,10 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
-from sglang.srt.model_loader.snapshot.coordinator import Ballot, vote
+from sglang.srt.model_executor.model_runner_components.load_model_utils import (
+    Ballot,
+    vote,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=47, suite="base-a-test-cpu")
@@ -76,7 +79,7 @@ def _run_rank(rank, init_method):
         dist.destroy_process_group()
 
 
-class TestSnapshotCoordinator(unittest.TestCase):
+class TestLoadModelVote(unittest.TestCase):
     def test_subgroup_vote(self):
         with TemporaryDirectory() as directory:
             init_method = (Path(directory) / "gloo-init").as_uri()

@@ -34,7 +34,6 @@ from sglang.srt.model_executor.model_runner_components.startup_weight_load impor
     StartupWeightLoadState,
 )
 from sglang.srt.model_loader.loader import DefaultModelLoader
-from sglang.srt.model_loader.snapshot.coordinator import Ballot
 from sglang.srt.model_loader.weight_utils import initialize_capture_safe_weights
 from sglang.srt.runtime_context import get_exec, get_parallel, publish, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -687,7 +686,7 @@ class TestModelRunnerStartupWeightLoadOwnership(CustomTestCase):
 
         def record_vote(*, group, ballot):
             self.assertIs(group, tp_group)
-            self.assertEqual(ballot, Ballot())
+            self.assertEqual(ballot, load_model_utils.Ballot())
             self.assertIs(runner.startup_weight_load, manager)
             trace.append("vote")
 
@@ -716,7 +715,9 @@ class TestModelRunnerStartupWeightLoadOwnership(CustomTestCase):
             get_parallel().override(tp_group=object()),
         ):
             load_model_utils.vote_after_load(load_group=stage_group)
-        vote.assert_called_once_with(group=stage_group, ballot=Ballot())
+        vote.assert_called_once_with(
+            group=stage_group, ballot=load_model_utils.Ballot()
+        )
 
 
 class _SchedulerWorker:
