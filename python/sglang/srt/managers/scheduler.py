@@ -5430,13 +5430,15 @@ class Scheduler(
         reads it. A speculative forward writes draft and verify slots past
         ``written_tokens`` and produces its tracking slots on another stream,
         so its token and state writes are recorded as unknown."""
+        storage = kv_storage_of(self.req_to_token_pool, self.token_to_kv_pool_allocator)
+        if self.kv_shard_widening > 1:
+            # The sharded prefix gather reads this rank's pages on its own stream.
+            storage.join_side_streams(stream)
         forward_done = self.device_module.Event()
         forward_done.record(stream=stream)
         writes_unknown = not batch.spec_algorithm.is_none()
         with self.device_module.stream(self.schedule_stream):
-            kv_storage_of(
-                self.req_to_token_pool, self.token_to_kv_pool_allocator
-            ).record_forward(
+            storage.record_forward(
                 forward_done,
                 written_tokens=written_tokens,
                 token_writes_unknown=writes_unknown,

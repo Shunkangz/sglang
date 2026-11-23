@@ -1166,6 +1166,11 @@ class KVStorage:
             return self._allocator.mamba_allocator
         return self._allocator.window_allocators[sub_pool]
 
+    def join_side_streams(self, stream) -> None:
+        """Order ``stream`` after the sharded prefix gather, which reads this
+        rank's pages on its own stream: the forward's end then covers them."""
+        stream.wait_stream(self.view(self.owner).kv_gather_stream)
+
     def record_forward(
         self,
         forward_done: torch.cuda.Event,

@@ -51,6 +51,8 @@ class KVSizingInputs(msgspec.Struct, frozen=True, kw_only=True):
     pre_alloc_rows: int = 0
     extra_context_len: int = 0
     alignment: int = 4096
+    # The KV-sharding gather scratch: beside the arena, in the same budget.
+    kv_shard_scratch_bytes: int = 0
 
 
 class FixedAllocation(msgspec.Struct, frozen=True, kw_only=True):
@@ -110,6 +112,12 @@ def _fixed_terms(plan, inp, running, strategy):
         FixedAllocation(name=d.part.name, bytes=d.part.row_bytes * scratch_rows)
         for d in plan.scratch
     )
+    if inp.kv_shard_scratch_bytes:
+        terms.append(
+            FixedAllocation(
+                name="kv_shard_gather_scratch", bytes=inp.kv_shard_scratch_bytes
+            )
+        )
     return tuple(terms)
 
 

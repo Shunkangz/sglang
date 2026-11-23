@@ -153,6 +153,7 @@ class TestKVShardedMLADispatch(CustomTestCase):
         self.exec_config = SimpleNamespace(
             deterministic=SimpleNamespace(enable_deterministic_inference=False)
         )
+        self.memory_config = SimpleNamespace(enable_unified_memory=False)
         for patcher in (
             mock.patch.object(abh, "_is_hip", False),
             mock.patch.object(
@@ -160,6 +161,7 @@ class TestKVShardedMLADispatch(CustomTestCase):
                 "get_parallel",
                 return_value=SimpleNamespace(enable_kv_cache_sharding=True),
             ),
+            mock.patch.object(abh, "get_memory", return_value=self.memory_config),
             mock.patch.object(abh, "get_exec", return_value=self.exec_config),
             mock.patch.object(abh, "is_in_tc_piecewise_cuda_graph", return_value=False),
             mock.patch.object(abh, "is_in_breakable_cuda_graph", return_value=False),
@@ -246,6 +248,37 @@ class TestKVShardedMLADispatch(CustomTestCase):
                     ),
                     AttnForwardMethod.MHA_CHUNKED_KV,
                 )
+
+    def test_unified_memory_pins_chunked_mha_for_every_extend(self):
+        # A rank of a sharded unified pool holds only its own pages: one-shot
+        # MHA and absorbed MLA would read pool rows it does not have.
+        self.memory_config.enable_unified_memory = True
+        for handler in (abh.handle_attention_fa3, abh.handle_attention_trtllm_mla):
+            for threshold in (0, 4096):
+                for prefix in (0, 64):
+                    for capacity in (0, 8192):
+                        with self.subTest(
+                            handler=handler.__name__,
+                            threshold=threshold,
+                            prefix=prefix,
+                            capacity=capacity,
+                        ):
+                            self.attn.chunked_prefix_cache_threshold = threshold
+                            self.assertEqual(
+                                handler(
+                                    self.attn,
+                                    self._batch(prefix=prefix, capacity=capacity),
+                                ),
+                                AttnForwardMethod.MHA_CHUNKED_KV,
+                            )
+
+    def test_unified_memory_refuses_a_forward_that_is_not_an_extend(self):
+        self.memory_config.enable_unified_memory = True
+        batch = self._batch()
+        batch.forward_mode = ForwardMode.DECODE
+        for handler in (abh.handle_attention_fa3, abh.handle_attention_trtllm_mla):
+            with self.assertRaisesRegex(NotImplementedError, "prefill extends"):
+                handler(self.attn, batch)
 
 
 if __name__ == "__main__":

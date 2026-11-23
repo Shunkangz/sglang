@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.mem_cache.kv.routed_cache import RoutedKVCache
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
 
@@ -37,6 +38,9 @@ def get_kv_shard_pool(token_to_kv_pool) -> Optional[PageInterleaveKVPoolMixin]:
     if isinstance(token_to_kv_pool, HybridLinearKVPool):
         # Hybrid pools stripe their inner full-attention pool.
         token_to_kv_pool = token_to_kv_pool.full_kv_pool
+    if isinstance(token_to_kv_pool, RoutedKVCache):
+        # A sharded unified pool keeps its token KV in one view: the owner's.
+        token_to_kv_pool = token_to_kv_pool.layer_router.wrapped_view()
     return (
         token_to_kv_pool
         if isinstance(token_to_kv_pool, PageInterleaveKVPoolMixin)

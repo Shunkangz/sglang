@@ -983,6 +983,8 @@ class TestTriFactorySizing(_PoolTestCase):
                                 cfg.KVCacheConfigurator._kv_layer_decls(configurator)
                             ),
                             post_capture_kv_active=False,
+                            kv_shard_spec=None,
+                            kv_shard_group=None,
                         )
                         # Run the production configurator AND factory. Reverting
                         # either top-level flag forwarding must break cleanup.

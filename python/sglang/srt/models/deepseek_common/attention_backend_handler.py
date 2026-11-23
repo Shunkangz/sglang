@@ -14,6 +14,7 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods
 from sglang.srt.models.deepseek_common.utils import _is_hip
 from sglang.srt.runtime_context import (
     get_exec,
+    get_memory,
     get_parallel,
     get_platform,
 )
@@ -144,10 +145,27 @@ def handle_attention_flashinfer(attn, forward_batch):
     return _handle_attention_backend(attn, forward_batch, "flashinfer")
 
 
+def _kv_shard_unified_memory(forward_batch) -> bool:
+    # A rank of a sharded unified pool holds only its own pages: the one read
+    # it serves is the cached prefix of a chunked-prefix extend.
+    if not (
+        get_parallel().enable_kv_cache_sharding and get_memory().enable_unified_memory
+    ):
+        return False
+    if not forward_batch.forward_mode.is_extend_without_speculative():
+        raise NotImplementedError(
+            "KV sharding of unified memory serves prefill extends only, got "
+            f"forward mode {forward_batch.forward_mode}"
+        )
+    return True
+
+
 def handle_attention_fa3(attn, forward_batch):
     # when deterministic inference is enabled, use MLA
     if get_exec().deterministic.enable_deterministic_inference:
         return _dispatch_mla_subtype(attn, forward_batch)
+    elif _kv_shard_unified_memory(forward_batch):
+        return AttnForwardMethod.MHA_CHUNKED_KV
     else:
         return _handle_attention_backend(attn, forward_batch, "fa3")
 
@@ -171,6 +189,8 @@ def handle_attention_fa4(attn, forward_batch):
 def handle_attention_trtllm_mla(attn, forward_batch):
     if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
         return AttnForwardMethod.MLA
+    if _kv_shard_unified_memory(forward_batch):
+        return AttnForwardMethod.MHA_CHUNKED_KV
 
     sum_extend_prefix_lens = _get_sum_extend_prefix_lens(forward_batch)
     if forward_batch.forward_mode.is_extend_without_speculative() and (

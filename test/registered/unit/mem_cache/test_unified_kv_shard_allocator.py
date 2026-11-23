@@ -55,6 +55,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv.alloc.kv_shard import ShardedOwner
+from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
+from sglang.srt.mem_cache.kv.layout.mla_shard import ShardedMLAView
 from sglang.srt.mem_cache.page_interleave import PageShardSpec
 from sglang.srt.mem_cache.prefill_budget import ChainPrefillBudget
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -1021,6 +1023,45 @@ class TestShardedChainSurface(CustomTestCase):
             self.allocator.alloc(PS)
         self.assertEqual(self.rank.owner.live_page_count, 0)
         self.assertEqual(self.allocator.kv_shard.live_pages(), [0, 0])
+
+    def test_a_forward_writes_its_stripe_and_reads_stay_logical(self):
+        """A plan's write ids take the owner rule; its read ids stay logical
+        for the reader that maps them onto the gather scratch."""
+        ids = self._take(4)
+        bundle = self.rank.bundle
+        runner_ids = RunnerIds(
+            req_to_token=bundle.req_to_token_pool.req_to_token,
+            token_to_kv_pool_allocator=self.allocator,
+            token_to_kv_pool=bundle.token_to_kv_pool,
+            page_size=PS,
+            device="cpu",
+        )
+        plan = runner_ids.plan(
+            req_pool_indices=torch.tensor([0]),
+            seq_lens=torch.tensor([ids.numel()]),
+            seq_lens_cpu=torch.tensor([ids.numel()]),
+            write_virtual=ids,
+        )
+        physical = plan.write_ids(runner_ids)
+        owned = (ids // PS) % 2 == 1
+        self.assertTrue(bool((physical[owned] > 0).all()))
+        self.assertTrue(bool((physical[~owned] == 0).all()))
+        self.assertTrue(torch.equal(physical, self.allocator.translate_write_loc(ids)))
+        self.assertFalse(runner_ids.reads_are_translated)
+        self.assertIs(runner_ids.translate_dcp_read_ids(ids), ids)
+        with self.assertRaises(AssertionError):
+            self.allocator.translate_kv_loc(ids)
+
+
+class TestShardedViewBackstop(CustomTestCase):
+    def test_a_page_table_read_during_a_sharded_extend_is_refused(self):
+        """A dispatch that misses the chunked-prefix pin fails; it must not
+        read this rank's share of the prefix as if it were all of it."""
+        view = object.__new__(ShardedMLAView)
+        view._shard_extend_active = True
+        for read in (view.get_key_buffer, view.get_value_buffer):
+            with self.assertRaises(NotImplementedError):
+                read(0)
 
 
 class TestShardedControlPathShortcuts(CustomTestCase):
