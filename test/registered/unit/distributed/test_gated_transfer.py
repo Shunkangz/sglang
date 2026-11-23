@@ -430,7 +430,16 @@ class TestTransferChainSingleGpu(CustomTestCase):
     def test_paused_gate_holds_the_first_chunk(self):
         """A paused gate holds a run's first chunk, but not its setup and
         finish ops: a run without chunks (a broadcast's non-root ranks)
-        lands through it."""
+        lands through it. On both paths: a copy run (inline) and the same
+        copies as plain callables (window and feeder)."""
+        for inline in (True, False):
+            with self.subTest(inline=inline):
+                try:
+                    self._paused_gate_holds_the_first_chunk(inline)
+                finally:  # the subtests share one gate: never leave it parked
+                    _release_parked_work()
+
+    def _paused_gate_holds_the_first_chunk(self, inline):
         chain = TransferChain(Link.NVLINK)
         no_chunks = TransferChain(Link.NVLINK)  # same link and device: same gate
         gate = chain._gate
@@ -439,12 +448,16 @@ class TestTransferChainSingleGpu(CustomTestCase):
         dst = self._pinned(src.numel())
         marks = [_HostWord() for _ in range(4)]
         torch.cuda.synchronize()
+        chunks = copy_chunks(dst, src, _MiB)
+        if not inline:
+            chunks = [lambda stream, c=c: c(stream) for c in chunks]
         chain.run(
-            copy_chunks(dst, src, _MiB),
+            chunks,
             setup=[_mark(marks[0])],
             finish=[_mark(marks[1])],
             after=self.after,
         )
+        self.assertEqual(chain._enqueued == 0, inline)
         landed = no_chunks.run(
             [], setup=[_mark(marks[2])], finish=[_mark(marks[3])], after=self.after
         )
@@ -636,6 +649,81 @@ class TestTransferChainSingleGpu(CustomTestCase):
         self.assertLessEqual(enqueued, gated_transfer._WINDOW)
         self.assertTrue(chain.query(first))
         self.assertTrue(torch.equal(out, src))  # the second run came after the first
+
+    def test_copy_run_is_enqueued_whole_without_the_feeder(self):
+        """A copy run of a window of chunks is enqueued whole by run(), even
+        behind a paused gate and outside the window, so no feeder thread
+        competes for the GIL with the thread launching the forward. It lands
+        once the gate opens, before a later run. A third run while the first
+        is still in flight takes the feeder path, bounding what stays queued."""
+        chain = TransferChain(Link.NVLINK)
+        n = gated_transfer._WINDOW
+        src = self._src(_MiB)
+        dst, out, last = (torch.zeros_like(src) for _ in range(3))
+        torch.cuda.synchronize()
+        caller = torch.cuda.current_stream()
+        chain._gate.pause(self.control)
+        self.control.synchronize()
+        try:
+            first = chain.run(copy_chunks(dst, src, _MiB // n), after=self.after)
+            second = chain.run(copy_chunks(out, dst), after=self.after)
+            self.assertEqual(torch.cuda.current_stream(), caller)
+            self.assertEqual(chain._enqueued_run, second)
+            self.assertEqual(chain._enqueued, 0)  # nothing went through the window
+            third = chain.run(copy_chunks(last, out), after=self.after)
+            self.assertGreater(chain._enqueued, 0)
+            time.sleep(0.05)
+            self.assertFalse(chain.query(first))  # parked at the gate
+        finally:
+            chain._gate.force_open()
+        self.assertTrue(_wait_until(lambda: chain.query(third)))
+        self.assertTrue(torch.equal(last, src))
+
+    def test_copy_run_drains_one_chunk(self):
+        """A copy run keeps the drain bound: a pause landing while chunk 0
+        copies holds chunk 1, whose gate is read only once chunk 0 retired."""
+        chain = TransferChain(Link.NVLINK)
+        blocker = _HostWord()
+        chunk = 512 * _MiB  # milliseconds over PCIe or C2C: the pause lands mid-copy
+        src = self._src(2 * chunk)
+        dst = self._pinned(src.numel())
+        torch.cuda.synchronize()
+        held = _Blocked(lambda stream: None, blocker)
+        landed = chain.run(copy_chunks(dst, src, chunk), setup=[held], after=self.after)
+        self.assertEqual(chain._enqueued, 0)  # the inline path
+        held.wait_reached()
+        blocker.set(1)
+        self.assertTrue(_wait_until(lambda: bool(dst[:4096].any())))  # chunk 0 copies
+        chain._gate._word.value = 6
+        time.sleep(0.3)
+        self.assertEqual(int(dst[:chunk].count_nonzero()), chunk)
+        self.assertEqual(int(dst[chunk:].count_nonzero()), 0)
+        chain._gate.force_open()
+        self.assertTrue(_wait_until(lambda: chain.query(landed)))
+        self.assertTrue(torch.equal(dst, src.cpu()))
+
+    def test_raising_op_skips_the_rest_of_a_copy_run(self):
+        """As on the generic path, an op that raises in a copy run skips the
+        rest of the run, is raised by run(), and the ticket still lands; the
+        chain keeps working."""
+        chain = TransferChain(Link.NVLINK)
+        src = self._src(2 * _MiB)
+        dst, out = torch.zeros_like(src), torch.zeros_like(src)
+        torch.cuda.synchronize()
+
+        def broken(stream):
+            raise ValueError("setup failed")
+
+        caller = torch.cuda.current_stream()
+        with self.assertRaises(ValueError):
+            chain.run(copy_chunks(dst, src, _MiB), setup=[broken], after=self.after)
+        self.assertEqual(torch.cuda.current_stream(), caller)
+        self.assertEqual(chain._enqueued, 0)  # the inline path
+        self.assertTrue(_wait_until(chain.query))
+        self.assertEqual(int(dst.count_nonzero()), 0)  # its chunks were skipped
+        landed = chain.run(copy_chunks(out, src, _MiB), after=self.after)
+        self.assertTrue(_wait_until(lambda: chain.query(landed)))
+        self.assertTrue(torch.equal(out, src))
 
     def test_wait_enqueues_only_behind_an_enqueued_run(self):
         """A stream must not wait on work not enqueued yet: parked, it can
