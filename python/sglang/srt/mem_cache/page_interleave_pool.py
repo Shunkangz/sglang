@@ -72,7 +72,10 @@ from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
     dequantize_k_cache_paged_dsa,
 )
 from sglang.kernels.ops.kvcache import dsa_index_k_cache
-from sglang.kernels.ops.kvcache.mla_buffer import get_mla_kv_buffer_triton
+from sglang.kernels.ops.kvcache.mla_buffer import (
+    get_mla_kv_buffer_triton,
+    set_mla_kv_buffer_triton,
+)
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.distributed.device_communicators.gated_transfer import (
     Link,
@@ -265,15 +268,16 @@ class PageInterleaveKVPoolMixin:
         self._epoch = 0
         self._shard_extend_active = False
         self._block_pages = 0
-        # Strictly larger than any local physical page id: the owner-major
-        # sort key of logical page l is (l % N) * stride + l // N.
+        # Strictly larger than any local physical page id: the [owner, local
+        # page] index of logical page l is (l % N) * stride + l // N.
         self._local_page_stride = self.size // spec.page_size + 2
         self._debug_plan_checks = envs.SGLANG_DEBUG_MEMORY_POOL.get()
         self._send_pages: Optional[torch.Tensor] = None
         self._send_rows: Optional[torch.Tensor] = None
-        self._write_plan_key = None
-        self._write_plan: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self._write_rows_key = None
+        self._write_rows: Optional[torch.Tensor] = None
         self._translate_cache: Dict[Tuple[int, int], torch.Tensor] = {}
+        self._init_shard_plan_buffers()
 
         scratch_bytes = sum(
             tensor.numel() * tensor.element_size()
@@ -378,6 +382,35 @@ class PageInterleaveKVPoolMixin:
 
     # ---- per-batch plan -------------------------------------------------------
 
+    def _init_shard_plan_buffers(self) -> None:
+        """Device buffers every per-batch plan reuses."""
+        spec = self.shard_spec
+        ps = spec.page_size
+        # [owner, local page] marks of the batch's prefix pages.
+        self._prefix_page_marks = torch.zeros(
+            (spec.shard_size, self._local_page_stride),
+            dtype=torch.bool,
+            device=self.device,
+        )
+        self._shard_owner_ids = torch.arange(
+            spec.shard_size, dtype=torch.int32, device=self.device
+        )[:, None]
+        # 1-based ranks within a send block, which holds at most an even
+        # share of the prefix region.
+        self._send_page_ranks = torch.arange(
+            1,
+            spec.max_prefix_tokens // spec.logical_page_size + 1,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self._chunk_page_slots = torch.arange(
+            self._chunk_base // ps,
+            self._trash_base // ps,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self._page_row_offsets = torch.arange(ps, dtype=torch.int64, device=self.device)
+
     def begin_shard_extend(
         self,
         req_to_token: torch.Tensor,
@@ -390,9 +423,20 @@ class PageInterleaveKVPoolMixin:
         Called once per scheduled extend batch, at attention-metadata build
         time (after ``req_to_token`` holds the batch's allocation). All inputs
         are mirrored across ranks, so every rank derives the identical plan.
+        Every shape comes from the host lengths, so building the plan issues
+        no host sync unless ``SGLANG_DEBUG_MEMORY_POOL`` checks the owners.
         """
         spec = self.shard_spec
         ps, shard_size = spec.page_size, spec.shard_size
+        prefix_lens = [int(n) for n in prefix_lens_cpu]
+        seq_lens = [int(n) for n in seq_lens_cpu]
+
+        # The logical page of every position-page of every request: one row
+        # gather, sliced per request below with host lengths.
+        page_ids = (
+            req_to_token[:, : max(seq_lens, default=0) : ps][req_pool_indices].long()
+            // ps
+        )
 
         # Per-request page samples. One logical page per position-page
         # (whole-page draws + ps-aligned chunk starts), so stride-ps sampling
@@ -402,28 +446,25 @@ class PageInterleaveKVPoolMixin:
         # ONE cyclic rotation run (graft-declined inserts + per-request
         # bases), so a rank owns at most ceil(K_i / N) of its pages, and the
         # cross-request dedup below only shrinks per-rank counts.
-        empty = torch.empty((0,), dtype=torch.int64, device=self.device)
         prefix_parts = []
         chunk_parts = []
         block_pages = 0
-        for i in range(len(prefix_lens_cpu)):
-            prefix_len, seq_len = int(prefix_lens_cpu[i]), int(seq_lens_cpu[i])
+        for i, (prefix_len, seq_len) in enumerate(zip(prefix_lens, seq_lens)):
             assert prefix_len % ps == 0, (
                 f"sharded prefill requires physical-page-aligned prefixes "
                 f"(the radix-tree match quantum), got prefix_len="
                 f"{prefix_len}, page_size={ps}"
             )
-            row = req_to_token[req_pool_indices[i]]
-            if prefix_len:
-                pages_i = row[:prefix_len:ps].long() // ps
+            n_prefix = prefix_len // ps
+            if n_prefix:
+                pages_i = page_ids[i, :n_prefix]
                 prefix_parts.append(pages_i)
-                block_pages += ceil_div(prefix_len // ps, shard_size)
+                block_pages += ceil_div(n_prefix, shard_size)
                 if self._debug_plan_checks:
                     # Owner-congruence: each request's prefix owners must be
-                    # exactly cyclic — the block bound above relies on it. A
-                    # broken rotation would overflow a rank's block and the
-                    # translation would silently address the wrong scratch
-                    # rows. Fail loud instead (debug mode syncs).
+                    # exactly cyclic — the block bound above relies on it. The
+                    # plan only catches an overflowing block, as a device-side
+                    # assert; name the request here (debug mode syncs).
                     owners = pages_i % shard_size
                     expected = (
                         int(owners[0])
@@ -437,82 +478,84 @@ class PageInterleaveKVPoolMixin:
                         f"(owners[:16]={owners[:16].tolist()})"
                     )
             if seq_len > prefix_len:
-                chunk_parts.append(row[prefix_len:seq_len:ps].long() // ps)
+                chunk_parts.append(page_ids[i, n_prefix : ceil_div(seq_len, ps)])
 
-        # A prefix page shared by several requests gathers into ONE scratch
-        # slot (torch.unique sorts — deterministic, mirrored); chunk pages
-        # are per-request fresh allocations, disjoint by construction.
-        prefix_pages = torch.unique(torch.cat(prefix_parts)) if prefix_parts else empty
-        chunk_pages = torch.cat(chunk_parts) if chunk_parts else empty
-        n_prefix = prefix_pages.numel()
-        n_chunk = chunk_pages.numel()
+        n_chunk = sum(part.numel() for part in chunk_parts)
         n_prefix_slots = shard_size * block_pages
         assert n_prefix_slots * ps <= spec.max_prefix_tokens, (
-            f"prefix ({n_prefix} pages, padded gather span "
-            f"{n_prefix_slots * ps} tokens) exceeds the scratch prefix "
-            f"capacity ({spec.max_prefix_tokens}) — the PrefillAdder scratch "
-            f"reservation should have deferred this batch"
+            f"prefix (padded gather span {n_prefix_slots * ps} tokens) exceeds "
+            f"the scratch prefix capacity ({spec.max_prefix_tokens}) — the "
+            f"PrefillAdder scratch reservation should have deferred this batch"
         )
         assert n_chunk * ps <= spec.chunk_tokens, (
             f"chunk ({n_chunk * ps} tokens) exceeds the scratch chunk "
             f"capacity ({spec.chunk_tokens})"
         )
 
-        self._page_pos.fill_(self._trash_base // ps)
-        if n_prefix:
-            # Owner-major slot assignment: sort the batch's unique pages by
-            # (owner, local page) so rank r's pages are contiguous at
-            # r * block_pages in local-page order — the same order rank r
-            # packs its send block below, on every rank (mirrored).
-            owners = prefix_pages % shard_size
-            local_pages = prefix_pages // shard_size
-            order = torch.argsort(owners * self._local_page_stride + local_pages)
-            sorted_pages = prefix_pages[order]
-            sorted_owners = owners[order]
-            counts = torch.bincount(sorted_owners, minlength=shard_size)
-            starts = torch.cumsum(counts, 0) - counts
-            within = (
-                torch.arange(n_prefix, dtype=torch.int64, device=self.device)
-                - starts[sorted_owners]
-            )
-            self._page_pos[sorted_pages] = (sorted_owners * block_pages + within).to(
-                torch.int32
-            )
+        if block_pages:
+            self._plan_prefix_pages(torch.cat(prefix_parts), block_pages)
+        else:
+            self._page_pos.fill_(self._trash_base // ps)
+            self._send_pages = None
+            self._send_rows = None
         if n_chunk:
-            self._page_pos[chunk_pages] = torch.arange(
-                self._chunk_base // ps,
-                self._chunk_base // ps + n_chunk,
-                dtype=torch.int32,
-                device=self.device,
-            )
+            # Chunk pages are per-request fresh allocations, disjoint by
+            # construction.
+            self._page_pos[torch.cat(chunk_parts)] = self._chunk_page_slots[:n_chunk]
 
         self._epoch += 1
         self._block_pages = block_pages
         self._shard_extend_active = True
         self._translate_cache.clear()
         if block_pages:
-            # This rank's owned pages in slot order (already local-sorted) —
-            # logical page l is its local physical page l // N — padded to
-            # the regular allgather block with the reserved trash page
-            # (local page 0), whose rows the plan never references.
-            own_local = sorted_pages[sorted_owners == self.shard_rank] // shard_size
-            n_pad = block_pages - own_local.numel()
-            if n_pad:
-                own_local = torch.cat(
-                    [
-                        own_local,
-                        torch.zeros((n_pad,), dtype=torch.int64, device=self.device),
-                    ]
-                )
-            self._send_pages = own_local
-            self._send_rows = (
-                own_local[:, None] * ps
-                + torch.arange(ps, dtype=torch.int64, device=self.device)
-            ).reshape(-1)
             self._prefetch_layer(self.start_layer)
-        else:
-            self._send_pages = None
-            self._send_rows = None
+
+    def _plan_prefix_pages(self, prefix_pages: torch.Tensor, block_pages: int) -> None:
+        """Owner-major scratch slots of the batch's prefix pages (every
+        ``_page_pos`` entry is rewritten) and this rank's padded send block.
+
+        Rank r's pages sit contiguous at ``r * block_pages`` in local-page
+        order, the same order rank r packs its send block in, on every rank
+        (mirrored). A prefix page shared by several requests marks a single
+        (owner, local page) cell, so it gathers into one scratch slot.
+        """
+        spec = self.shard_spec
+        ps, shard_size = spec.page_size, spec.shard_size
+        stride = self._local_page_stride
+        marks = self._prefix_page_marks
+        marks.zero_()
+        # Logical page l is local physical page l // N of owner l % N.
+        marks.view(-1).index_fill_(
+            0, (prefix_pages % shard_size) * stride + prefix_pages // shard_size, True
+        )
+        # Per owner, the count of marked pages at or below each local page:
+        # a marked page's position within its owner's block, plus one.
+        owned_count = torch.cumsum(marks, dim=1, dtype=torch.int32)
+        # An owner past the block bound would spill into the next owner's
+        # slots and truncate its send block; fail on device, without a sync.
+        torch._assert_async(
+            (owned_count[:, -1] <= block_pages).all(),
+            "a rank owns more prefix pages than its gather block holds "
+            "(prefix owners not cyclic)",
+        )
+        slots = owned_count + (self._shard_owner_ids * block_pages - 1)
+        # Logical page l = local * N + owner, so this view is [owner, local].
+        self._page_pos.view(stride, shard_size).t().copy_(
+            torch.where(marks, slots, self._trash_base // ps)
+        )
+
+        # The j-th owned page is the first local page whose count reaches
+        # j + 1. Past the last one searchsorted returns stride, which wraps to
+        # local page 0: the reserved trash page, whose rows the plan never
+        # references. Its bytes are undefined: the index-K stores and the
+        # non-CUDA fallbacks dump foreign tokens there during the pack.
+        send_pages = torch.searchsorted(
+            owned_count[self.shard_rank], self._send_page_ranks[:block_pages]
+        ).remainder_(stride)
+        self._send_pages = send_pages
+        self._send_rows = (send_pages[:, None] * ps + self._page_row_offsets).reshape(
+            -1
+        )
 
     def end_shard_extend(self) -> None:
         """Mark no sharded extend in flight (non-extend forward modes)."""
@@ -615,24 +658,22 @@ class PageInterleaveKVPoolMixin:
             self._translate_cache[key] = rows
         return rows
 
-    # ---- write plan (owner filter), cached per (loc tensor, epoch) --------------
+    # ---- write rows (owner filter), cached per (loc tensor, epoch) --------------
 
-    def _get_write_plan(self, loc: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """(owned positions into ``loc``, their local physical rows).
+    def _get_write_rows(self, loc: torch.Tensor) -> torch.Tensor:
+        """This rank's pool row for every position of ``loc``.
 
-        The same ``out_cache_loc`` tensor is passed for every layer of a
-        forward, so the owner filter is computed once per batch, not per
-        layer.
+        Positions another rank owns map to row 0 of the reserved local page
+        0: the CUDA row-scatter kernels skip it (``reserved_skip_index``), and
+        no plan reads it where a fallback writes it. The same
+        ``out_cache_loc`` tensor is passed for every layer of a forward, so
+        the rows are computed once per batch, not per layer.
         """
         key = (loc.data_ptr(), loc.numel(), self._epoch)
-        if self._write_plan_key != key:
-            owned_idx = torch.nonzero(
-                self.placement.local_mask(loc, self.shard_rank)
-            ).squeeze(1)
-            local_rows = self.placement.local_index(loc[owned_idx])
-            self._write_plan_key = key
-            self._write_plan = (owned_idx, local_rows)
-        return self._write_plan
+        if self._write_rows_key != key:
+            self._write_rows = self.placement.owned_local_index(loc, self.shard_rank)
+            self._write_rows_key = key
+        return self._write_rows
 
 
 class PageInterleaveMHATokenToKVPool(PageInterleaveKVPoolMixin, MHATokenToKVPool):
@@ -710,14 +751,12 @@ class PageInterleaveMHATokenToKVPool(PageInterleaveKVPoolMixin, MHATokenToKVPool
             slot.tensors["k"][rows] = cache_k
             slot.tensors["v"][rows] = cache_v
 
-        owned_idx, local_rows = self._get_write_plan(loc)
-        if owned_idx.numel() > 0:
-            self._store_kv_layer(
-                layer_id - self.start_layer,
-                local_rows,
-                cache_k.index_select(0, owned_idx),
-                cache_v.index_select(0, owned_idx),
-            )
+        self._store_kv_layer(
+            layer_idx=layer_id - self.start_layer,
+            loc=self._get_write_rows(loc),
+            cache_k=cache_k,
+            cache_v=cache_v,
+        )
 
     def get_key_buffer(self, layer_id: int):
         if self._shard_extend_active:
@@ -785,25 +824,25 @@ class PageInterleaveMLATokenToKVPool(PageInterleaveKVPoolMixin, MLATokenToKVPool
         layer_id = (
             layer_id_override if layer_id_override is not None else layer.layer_id
         )
+        if cache_k.dtype != self.dtype:
+            cache_k = cache_k.to(self.dtype)
         if self._shard_extend_active:
             # Stage the full chunk into this layer's slot (compute
             # stream): the absorbed / one-shot readers cover the current
             # chunk through the translated page table too.
             slot = self._slots[layer_id % 2]
             rows = self._translate_loc_cached(loc)
-            staged_k = cache_k
-            if staged_k.dtype != self.dtype:
-                staged_k = staged_k.to(self.dtype)
-            self._scratch_kv(slot)[rows] = staged_k
-        owned_idx, local_rows = self._get_write_plan(loc)
-        if owned_idx.numel() == 0:
-            return
-        super().set_kv_buffer(
-            layer,
-            local_rows,
-            cache_k.index_select(0, owned_idx),
-            cache_v,
-            layer_id_override=layer_id_override,
+            self._scratch_kv(slot)[rows] = cache_k
+        # The base door's index_put has no skip index, so every token another
+        # rank owns would hit row 0. Same bytes through the row scatter, which
+        # skips row 0.
+        if self.store_dtype != self.dtype:
+            cache_k = cache_k.view(self.store_dtype)
+        set_mla_kv_buffer_triton(
+            self.kv_buffer[layer_id - self.start_layer],
+            self._get_write_rows(loc),
+            cache_k[..., : self.kv_lora_rank],
+            cache_k[..., self.kv_lora_rank :],
         )
 
     def set_mla_kv_buffer(
@@ -824,14 +863,11 @@ class PageInterleaveMLATokenToKVPool(PageInterleaveKVPoolMixin, MLATokenToKVPool
             self._write_mla_kv_buffer(
                 slot.tensors["kv"], rows, cache_k_nope, cache_k_rope
             )
-        owned_idx, local_rows = self._get_write_plan(loc)
-        if owned_idx.numel() == 0:
-            return
         super().set_mla_kv_buffer(
             layer,
-            local_rows,
-            cache_k_nope.index_select(0, owned_idx),
-            cache_k_rope.index_select(0, owned_idx),
+            self._get_write_rows(loc),
+            cache_k_nope,
+            cache_k_rope,
             layer_id_override=layer_id_override,
         )
 
@@ -927,8 +963,8 @@ class _PageInterleaveIndexKeyCache(IndexKeyCache):
 
     def write_targets(
         self, layer_id: int, loc: torch.Tensor
-    ) -> List[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]]:
-        """(buffer, token slots, selected token rows or None) for a write.
+    ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        """(buffer, token slots) pairs, each covering every token of a write.
 
         During an extend every token is staged at its scratch slot; owned
         tokens also persist at their local slots. Writers apply their own
@@ -945,18 +981,13 @@ class _PageInterleaveIndexKeyCache(IndexKeyCache):
                 (
                     pool._slots[layer_id % 2].tensors["index_k"],
                     pool.translate_loc_to_scratch(loc),
-                    None,
                 )
             )
         # Indexer callers may reuse or mutate their location tensors. Compute
         # fresh indices instead of memoizing only their pointer and length.
-        owned_idx = torch.nonzero(
-            pool.placement.local_mask(loc, pool.shard_rank)
-        ).squeeze(1)
-        if owned_idx.numel():
-            targets.append(
-                (local, pool.placement.local_index(loc[owned_idx]), owned_idx)
-            )
+        # The index-K stores have no skip index: tokens another rank owns all
+        # land in slot 0 of the reserved local page 0, which nothing reads.
+        targets.append((local, pool.placement.owned_local_index(loc, pool.shard_rank)))
         return targets
 
     def store_quantized(
@@ -966,17 +997,13 @@ class _PageInterleaveIndexKeyCache(IndexKeyCache):
         index_k: torch.Tensor,
         index_k_scale: torch.Tensor,
     ) -> None:
-        for buf, slots, rows in self.write_targets(layer_id, loc):
+        for buf, slots in self.write_targets(layer_id, loc):
             dsa_index_k_cache.SetKAndS.execute(
                 pool=self.pool,
                 buf=buf,
                 loc=slots,
-                index_k=index_k if rows is None else index_k.index_select(0, rows),
-                index_k_scale=(
-                    index_k_scale
-                    if rows is None
-                    else index_k_scale.index_select(0, rows)
-                ),
+                index_k=index_k,
+                index_k_scale=index_k_scale,
             )
 
 

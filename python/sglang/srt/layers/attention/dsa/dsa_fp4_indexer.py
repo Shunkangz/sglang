@@ -138,9 +138,9 @@ class Fp4Indexer(Indexer):
                 dcp_rank=dcp_rank,
             )
             return
-        for buf, loc, rows in _index_k_write_targets(pool, layer_id, out_cache_loc):
+        for buf, loc in _index_k_write_targets(pool, layer_id, out_cache_loc):
             store_fp4_index_k_cache(
-                key if rows is None else key.index_select(0, rows),
+                key,
                 buf,
                 loc.contiguous(),
                 page_size=pool.index_page_size,

@@ -111,6 +111,11 @@ class PageInterleavePlacement:
         """Logical slots -> this rank's physical pool rows, order-preserving."""
         return self.local_index(loc[self.local_mask(loc, rank)])
 
+    def owned_local_index(self, loc: torch.Tensor, rank: int) -> torch.Tensor:
+        """Shape-preserving, sync-free ``filter_local``: slots another rank owns
+        map to row 0, which only the reserved logical pages ``[0, N)`` own."""
+        return torch.where(self.local_mask(loc, rank), self.local_index(loc), 0)
+
 
 def get_kv_shard_group(use_mla_backend: bool) -> GroupCoordinator:
     """The group KV pages are striped across — the axis that replicates KV
