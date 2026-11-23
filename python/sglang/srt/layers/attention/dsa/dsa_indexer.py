@@ -266,10 +266,10 @@ def _make_eager_idle_topk_result(
 
 
 def _index_k_write_targets(pool, layer_id: int, loc: torch.Tensor):
-    """(index-K buffer, token slots, selected token rows or None) to write."""
+    """(index-K buffer, token slots) pairs to write, each covering every token."""
     shard_pool = get_kv_shard_pool(pool)
     if shard_pool is None:
-        return ((pool.get_index_k_with_scale_buffer(layer_id=layer_id), loc, None),)
+        return ((pool.get_index_k_with_scale_buffer(layer_id=layer_id), loc),)
     return shard_pool.index_key_cache.write_targets(layer_id, loc)
 
 
@@ -1198,16 +1198,16 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             and not dsa_shards_index_k()
             and can_use_dsa_fused_store(torch.bfloat16, out_cache_loc.dtype, page_size)
         ):
-            for buf, loc, rows in _index_k_write_targets(pool, layer_id, out_cache_loc):
+            for buf, loc in _index_k_write_targets(pool, layer_id, out_cache_loc):
                 fused_k_indexer_norm_rope_store(
-                    key_raw if rows is None else key_raw.index_select(0, rows),
+                    key_raw,
                     buf,
                     loc,
                     self.k_norm.weight,
                     self.k_norm.bias,
                     self.k_norm.variance_epsilon,
                     self._indexer_cos_sin_cache,
-                    positions if rows is None else positions.index_select(0, rows),
+                    positions,
                     page_size,
                     hadamard=self.fused_indexer_hadamard,
                     neox_style=self.is_neox_style,
@@ -2367,11 +2367,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     dcp_rank=dcp_rank,
                 )
             else:
-                for buf, loc, rows in _index_k_write_targets(
-                    pool, layer_id, out_cache_loc
-                ):
+                for buf, loc in _index_k_write_targets(pool, layer_id, out_cache_loc):
                     fused_store_index_k_cache(
-                        key if rows is None else key.index_select(0, rows),
+                        key,
                         buf,
                         loc,
                         pool.index_page_size,

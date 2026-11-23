@@ -29,7 +29,9 @@ Pins the pure arithmetic that rotated owner-classed allocation hangs on:
    scratch, checked against a brute-force reference.
 5. ``begin_shard_extend`` plan capture (page positions, padded send rows,
    owner-congruence guard) with the gather stubbed out, following the
-   SimpleNamespace binding pattern of ``test_dsa_layer_shard_utils.py``.
+   SimpleNamespace binding pattern of ``test_dsa_layer_shard_utils.py``, and
+   its bit-exact equivalence to the host-syncing sorting plan on random
+   batches.
 6. MTP draft pool construction, shared allocator/layout validation, and scratch
    sizing for separate target and draft pools.
 7. The P/D send filter ``filter_kv_indices_for_shard_rank`` and the sender's
@@ -51,6 +53,7 @@ and attention coverage lives in ``test_page_sharded_dsa_attention.py``.
 import ctypes
 import gc
 import math
+import random
 import shutil
 import unittest
 import unittest.mock
@@ -121,6 +124,7 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.platforms.interface import PlatformCapabilities
 from sglang.srt.runtime_context import get_context, get_memory, get_parallel, get_spec
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import ceil_div
@@ -1628,13 +1632,18 @@ def _make_pool_stub(spec, shard_rank=0, debug=True, table_pages=4096):
     stub._page_pos = torch.full(
         (table_pages,), stub._trash_base // PS, dtype=torch.int32
     )
-    stub._local_page_stride = table_pages
+    # The pool sizes its page table N local-page strides long.
+    stub._local_page_stride = table_pages // N
     stub._epoch = 0
-    stub._write_plan_key = stub._write_plan = None
+    stub._write_rows_key = stub._write_rows = None
     stub._translate_cache = {}
     stub._debug_plan_checks = debug
+    PageInterleaveKVPoolMixin._init_shard_plan_buffers(stub)
     stub.translate_loc_to_scratch = lambda loc: (
         PageInterleaveKVPoolMixin.translate_loc_to_scratch(stub, loc)
+    )
+    stub._plan_prefix_pages = lambda prefix_pages, block_pages: (
+        PageInterleaveKVPoolMixin._plan_prefix_pages(stub, prefix_pages, block_pages)
     )
     stub.prefetched = []
     stub._prefetch_layer = lambda layer_id: stub.prefetched.append(layer_id)
@@ -1821,6 +1830,174 @@ class TestBeginShardExtendPlan(CustomTestCase):
         self.assertIn("cyclic", str(ctx.exception))
 
 
+def _sorting_plan(
+    spec, local_page_stride, req_to_token, req_pool_indices, prefix_lens, seq_lens
+):
+    """The host-syncing unique/argsort/bincount plan that begin_shard_extend
+    must reproduce bit for bit: (_page_pos, [N, block] send pages, block)."""
+    ps, n = spec.page_size, spec.shard_size
+    device = req_to_token.device
+    page_pos = torch.full(
+        (n * local_page_stride,),
+        (spec.max_prefix_tokens + spec.chunk_tokens) // ps,
+        dtype=torch.int32,
+        device=device,
+    )
+    prefix_parts, chunk_parts, block_pages = [], [], 0
+    for i, (prefix_len, seq_len) in enumerate(zip(prefix_lens, seq_lens)):
+        row = req_to_token[req_pool_indices[i]]
+        if prefix_len:
+            prefix_parts.append(row[:prefix_len:ps].long() // ps)
+            block_pages += ceil_div(prefix_len // ps, n)
+        if seq_len > prefix_len:
+            chunk_parts.append(row[prefix_len:seq_len:ps].long() // ps)
+    send_pages = None
+    if prefix_parts:
+        pages = torch.unique(torch.cat(prefix_parts))
+        owners = pages % n
+        order = torch.argsort(owners * local_page_stride + pages // n)
+        pages, owners = pages[order], owners[order]
+        counts = torch.bincount(owners, minlength=n)
+        within = (
+            torch.arange(pages.numel(), device=device)
+            - (torch.cumsum(counts, 0) - counts)[owners]
+        )
+        page_pos[pages] = (owners * block_pages + within).to(torch.int32)
+        send_pages = torch.stack(
+            [
+                torch.cat([own, own.new_zeros(block_pages - own.numel())])
+                for own in (pages[owners == rank] // n for rank in range(n))
+            ]
+        )
+    if chunk_parts:
+        chunk_pages = torch.cat(chunk_parts)
+        first = spec.max_prefix_tokens // ps
+        page_pos[chunk_pages] = torch.arange(
+            first, first + chunk_pages.numel(), dtype=torch.int32, device=device
+        )
+    return page_pos, send_pages, block_pages
+
+
+def assert_matches_sorting_plan(
+    pool, req_to_token, req_pool_indices, prefix_lens, seq_lens
+):
+    """Check the pool's installed plan; returns every rank's send pages."""
+    ps = pool.shard_spec.page_size
+    page_pos, send_pages, block_pages = _sorting_plan(
+        pool.shard_spec,
+        pool._local_page_stride,
+        req_to_token,
+        req_pool_indices,
+        prefix_lens,
+        seq_lens,
+    )
+    assert pool._block_pages == block_pages
+    assert torch.equal(pool._page_pos, page_pos), "page positions differ"
+    if send_pages is None:
+        assert pool._send_pages is None and pool._send_rows is None
+        return None
+    own = send_pages[pool.shard_rank]
+    assert torch.equal(pool._send_pages, own), "send pages differ"
+    rows = (own[:, None] * ps + torch.arange(ps, device=own.device)).reshape(-1)
+    assert torch.equal(pool._send_rows, rows), "send rows differ"
+    return send_pages
+
+
+def random_shard_batch(rng, shard_size, page_size, local_pages):
+    """(pages, prefix_len, seq_len) requests of one mirrored extend batch.
+
+    Each prefix is one cyclic-owner run from a random rotation base over
+    shuffled local pages, the block bound's precondition. A request may extend
+    another's prefix (shared pages), have no prefix, or no new tokens; new
+    tokens may end mid-page.
+    """
+    free = [
+        rng.sample(range(1, local_pages + 1), local_pages) for _ in range(shard_size)
+    ]
+
+    def take(base, start, count):
+        owners = [(base + p) % shard_size for p in range(start, start + count)]
+        return [free[owner].pop() * shard_size + owner for owner in owners]
+
+    chains = []
+    requests = []
+    for _ in range(rng.randint(1, 4)):
+        if chains and rng.random() < 0.5:
+            chain, base = rng.choice(chains)
+            shared = chain[: rng.randint(1, len(chain))]
+            prefix = shared + take(base, len(shared), rng.randint(0, 2 * shard_size))
+        else:
+            base = rng.randrange(shard_size)
+            prefix = take(base, 0, rng.choice([0, rng.randint(1, 3 * shard_size)]))
+        if prefix:
+            chains.append((prefix, base))
+        new_tokens = rng.randint(1, 3 * page_size)
+        if prefix and rng.random() < 0.25:
+            new_tokens = 0
+        pages = prefix + take(base, len(prefix), ceil_div(new_tokens, page_size))
+        prefix_len = len(prefix) * page_size
+        requests.append((pages, prefix_len, prefix_len + new_tokens))
+    return requests
+
+
+def request_locs(pages, seq_len, page_size, device):
+    return torch.tensor(
+        [pages[p // page_size] * page_size + p % page_size for p in range(seq_len)],
+        dtype=torch.int64,
+        device=device,
+    )
+
+
+def shard_batch_tables(requests, page_size, device):
+    """req_to_token holding the requests at nonconsecutive rows, and the row ids."""
+    req_ids = torch.arange(len(requests)) * 2 + 1
+    table = torch.zeros(
+        (2 * len(requests) + 1, max(seq_len for _, _, seq_len in requests)),
+        dtype=torch.int32,
+    )
+    for row_id, (pages, _, seq_len) in zip(req_ids.tolist(), requests):
+        table[row_id, :seq_len] = request_locs(pages, seq_len, page_size, "cpu")
+    return table.to(device), req_ids.to(device)
+
+
+class TestSyncFreePlanEquivalence(CustomTestCase):
+    def test_matches_sorting_plan_on_random_batches(self):
+        """The marked-cell plan must equal the sorting plan bit for bit (page
+        table, send pages and rows, block) on every rank of a reused pool:
+        shared prefix pages, prefix-less and prefix-only requests, partial
+        tail pages, and stale state from the previous batch."""
+        rng = random.Random(0)
+        stubs = [_make_pool_stub(_make_spec(rank), rank) for rank in range(N)]
+        for _ in range(100):
+            requests = random_shard_batch(rng, N, PS, local_pages=200)
+            table, req_ids = shard_batch_tables(requests, PS, "cpu")
+            prefix_lens = [prefix_len for _, prefix_len, _ in requests]
+            seq_lens = [seq_len for _, _, seq_len in requests]
+            for stub in stubs:
+                PageInterleaveKVPoolMixin.begin_shard_extend(
+                    stub, table, req_ids, prefix_lens, seq_lens
+                )
+                assert_matches_sorting_plan(stub, table, req_ids, prefix_lens, seq_lens)
+
+
+class TestSyncFreePlanBlockOverflow(CustomTestCase):
+    def test_owner_over_block_fails_without_debug_checks(self):
+        """A rank owning more prefix pages than the block bound would spill
+        its extra page into the next owner's first slot. The plan must fail
+        on every rank even with the debug cyclicity guard off."""
+        pages = _chain_pages(base=1, n_pages=5)
+        pages[1] = 30 * N + 1  # prefix owners [1, 1, 3, 0]: rank 1 owns 2 > 1
+        row = _chain_row(pages, 5 * PS)
+        for rank in range(N):
+            with self.assertRaisesRegex(RuntimeError, "gather block"):
+                _run_begin(
+                    _make_pool_stub(_make_spec(rank), rank, debug=False),
+                    [4 * PS],
+                    [5 * PS],
+                    [row],
+                )
+
+
 class TestScratchTranslation(CustomTestCase):
     def _plan(self, base=2, n_prefix=7, n_chunk=9, rank=1):
         pages = _chain_pages(base=base, n_pages=n_prefix + n_chunk)
@@ -1921,25 +2098,23 @@ class TestWritePlan(CustomTestCase):
         stub.placement = PageInterleavePlacement(spec)
         stub.shard_rank = 2
         stub._epoch = 1
-        stub._write_plan_key = stub._write_plan = None
+        stub._write_rows_key = stub._write_rows = None
 
         loc = torch.arange(5 * GS, 7 * GS)  # two whole groups
-        owned_idx, local_rows = PageInterleaveKVPoolMixin._get_write_plan(stub, loc)
-        self.assertEqual(owned_idx.numel(), 2 * PS)
-        # Owned rows are ps-contiguous runs at [Q*ps, (Q+1)*ps).
-        self.assertTrue(
-            torch.equal(
-                local_rows,
-                torch.cat([torch.arange(5 * PS, 6 * PS), torch.arange(6 * PS, 7 * PS)]),
-            )
-        )
+        rows = PageInterleaveKVPoolMixin._get_write_rows(stub, loc)
+        # Owned rows are ps-contiguous runs at [Q*ps, (Q+1)*ps); every other
+        # token maps to the reserved row 0.
+        expect = torch.zeros_like(loc)
+        expect[2 * PS : 3 * PS] = torch.arange(5 * PS, 6 * PS)
+        expect[GS + 2 * PS : GS + 3 * PS] = torch.arange(6 * PS, 7 * PS)
+        self.assertTrue(torch.equal(rows, expect))
         # Same tensor + same epoch -> cached (identity).
-        again = PageInterleaveKVPoolMixin._get_write_plan(stub, loc)
-        self.assertIs(again[0], owned_idx)
+        again = PageInterleaveKVPoolMixin._get_write_rows(stub, loc)
+        self.assertIs(again, rows)
         # Epoch bump invalidates.
         stub._epoch = 2
-        fresh = PageInterleaveKVPoolMixin._get_write_plan(stub, loc)
-        self.assertIsNot(fresh[0], owned_idx)
+        fresh = PageInterleaveKVPoolMixin._get_write_rows(stub, loc)
+        self.assertIsNot(fresh, rows)
 
     def test_partial_tail_page_may_own_nothing(self):
         spec = _make_spec(shard_rank=3)
@@ -1947,12 +2122,11 @@ class TestWritePlan(CustomTestCase):
         stub.placement = PageInterleavePlacement(spec)
         stub.shard_rank = 3
         stub._epoch = 1
-        stub._write_plan_key = stub._write_plan = None
+        stub._write_rows_key = stub._write_rows = None
         # 10 tokens: all inside owner-0's page of the group.
         loc = torch.arange(8 * GS, 8 * GS + 10)
-        owned_idx, local_rows = PageInterleaveKVPoolMixin._get_write_plan(stub, loc)
-        self.assertEqual(owned_idx.numel(), 0)
-        self.assertEqual(local_rows.numel(), 0)
+        rows = PageInterleaveKVPoolMixin._get_write_rows(stub, loc)
+        self.assertTrue(torch.equal(rows, torch.zeros_like(loc)))
 
 
 class TestShardedPoolFootprint(CustomTestCase):
@@ -2026,10 +2200,19 @@ class TestShardedPoolFootprint(CustomTestCase):
                 cache_k[:, 0, 1] = (token // 128 + 1).to(torch.bfloat16)
                 stored = []
                 for pool in pools:
-                    pool.set_kv_buffer(SimpleNamespace(layer_id=0), loc, cache_k, None)
+                    # The MLA row scatter dispatches on the platform; take
+                    # its torch-native path for CPU pools on a GPU host too.
+                    with unittest.mock.patch(
+                        "sglang.srt.platforms.current_platform",
+                        SimpleNamespace(capabilities=PlatformCapabilities()),
+                    ):
+                        pool.set_kv_buffer(
+                            SimpleNamespace(layer_id=0), loc, cache_k, None
+                        )
                     tags = pool.kv_buffer[0][:, 0, :2].float()
+                    # Tokens other ranks own map to the skipped row 0; every
+                    # row past the reserved page is filled, and no more.
                     rows = torch.nonzero(tags[:, 0]).squeeze(1)
-                    # Every row past the padded page is filled, and no more.
                     self.assertTrue(
                         torch.equal(rows, torch.arange(PS, PS + stock.size))
                     )

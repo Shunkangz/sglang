@@ -17,6 +17,7 @@ in ``test_page_interleave_shard.py``.
 import os
 import tempfile
 import unittest
+from contextlib import contextmanager
 from types import MethodType, SimpleNamespace
 from unittest.mock import patch
 
@@ -48,6 +49,16 @@ _INDEXER_KV_LORA_RANK = 512
 _INDEXER_QK_ROPE = 64
 _INDEXER_START_LAYER = 3
 _INDEXER_SKIP_TOPK = [False, True, False, False, False]
+
+
+@contextmanager
+def _no_host_sync():
+    """Raise on any host sync that torch's sync debug mode detects."""
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        yield
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
 
 
 def _assert_bytes(got, expected, label):
@@ -192,19 +203,19 @@ class _IndexerCacheCheck:
 
     def store(self, locs, layer_id, generation):
         values = _latent_values(locs, layer_id, generation)
-        for pool in (self.pool, self.reference):
-            pool.set_mla_kv_buffer(
-                SimpleNamespace(layer_id=layer_id),
-                locs,
-                values[..., :_INDEXER_KV_LORA_RANK].contiguous(),
-                values[..., _INDEXER_KV_LORA_RANK:].contiguous(),
-            )
+        nope = values[..., :_INDEXER_KV_LORA_RANK].contiguous()
+        rope = values[..., _INDEXER_KV_LORA_RANK:].contiguous()
+        layer = SimpleNamespace(layer_id=layer_id)
+        with _no_host_sync():
+            self.pool.set_mla_kv_buffer(layer, locs, nope, rope)
+        self.reference.set_mla_kv_buffer(layer, locs, nope, rope)
         if _INDEXER_SKIP_TOPK[layer_id - _INDEXER_START_LAYER]:
             return
         keys, scales = _index_values(locs, layer_id, generation)
         write_scales = scales[:, 0] if generation % 2 else scales
-        for pool in (self.pool, self.reference):
-            pool.set_index_k_scale_buffer(layer_id, locs, keys, write_scales)
+        with _no_host_sync():
+            self.pool.set_index_k_scale_buffer(layer_id, locs, keys, write_scales)
+        self.reference.set_index_k_scale_buffer(layer_id, locs, keys, write_scales)
 
         # Check the reference's packing independently, including both scales
         # shapes accepted by SetKAndS and every valid token in partial pages.
@@ -233,9 +244,10 @@ class _IndexerCacheCheck:
             torch.arange(owned.shape[0], device=self.device) * self.world + self.rank
         )
         expected = self.reference.index_k_with_scale_buffer[local_layer][logical_pages]
-        # Comparing the whole allocation catches writes to foreign pages and
-        # overwrites of untouched bytes in a partially filled page.
-        _assert_bytes(owned, expected, f"owned index layer {layer_id}")
+        # Comparing every real page catches writes to foreign pages and
+        # overwrites of untouched bytes in a partially filled page. Local
+        # page 0 is reserved: tokens another rank owns are dumped into it.
+        _assert_bytes(owned[1:], expected[1:], f"owned index layer {layer_id}")
 
     def seed(self, pages, generation):
         self.pool.end_shard_extend()
@@ -665,7 +677,8 @@ class TestShardedDSAIndexerWrite(unittest.TestCase):
             with self.subTest(fused_prepare=fused_prepare):
                 for buffer in (reference_buffer, local_buffer, scratch):
                     buffer.zero_()
-                for pool in (reference, sharded):
+
+                def store(pool):
                     with patch.object(
                         dsa_indexer, "get_token_to_kv_pool", return_value=pool
                     ):
@@ -677,12 +690,20 @@ class TestShardedDSAIndexerWrite(unittest.TestCase):
                             indexer._store_index_k_cache(
                                 batch, 0, key, act_quant=act_quant
                             )
-                # Every key is staged at its scratch row; rank 0 keeps even pages.
+
+                store(reference)
+                # The first sharded store JIT-compiles outside the check; the
+                # second rewrites the same bytes.
+                store(sharded)
+                with _no_host_sync():
+                    store(sharded)
+                # Every key is staged at its scratch row; rank 0 keeps even
+                # pages, past the reserved local page 0 that foreign keys hit.
                 torch.testing.assert_close(
                     scratch[sharded._page_pos.long()], reference_buffer, rtol=0, atol=0
                 )
                 torch.testing.assert_close(
-                    local_buffer, reference_buffer[::2], rtol=0, atol=0
+                    local_buffer[1:], reference_buffer[::2][1:], rtol=0, atol=0
                 )
         torch.cuda.synchronize()
 

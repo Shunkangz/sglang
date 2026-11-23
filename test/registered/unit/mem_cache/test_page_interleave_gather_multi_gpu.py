@@ -33,7 +33,9 @@ validate actually addresses the bytes the collective delivers:
    layer IDs across batches.
 4. QSA hybrid pools: sharded full-attention KV, replicated compressed keys,
    and cached-prefix reads through the scratch-translated slot table.
-5. The multicast gather copies on copy engines (no NCCL kernel), and every
+5. The gather plan and the MLA/MHA write doors issue no host sync, and match
+   the sorting plan and compacted owner-filtered writes bit for bit.
+6. The multicast gather copies on copy engines (no NCCL kernel), and every
    rank falls back to NCCL together for a cross-node group or a rank without
    a multicast mapping.
 
@@ -51,13 +53,20 @@ import functools
 import gc
 import math
 import os
+import random
 import unittest
 import unittest.mock
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
 import torch
 import torch.multiprocessing as mp
+from test_page_interleave_shard import (
+    assert_matches_sorting_plan,
+    random_shard_batch,
+    request_locs,
+    shard_batch_tables,
+)
 
 from sglang.srt.distributed import (
     init_distributed_environment,
@@ -75,6 +84,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.kv_shard_hooks import get_kv_shard_pool
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.mem_cache.page_interleave import PageShardSpec, get_kv_shard_group
 from sglang.srt.mem_cache.page_interleave_pool import (
     PageInterleaveMHATokenToKVPool,
@@ -860,6 +870,247 @@ class TestPageInterleaveGatherMultiGpu(CustomTestCase):
             mp.spawn(
                 _run_mha,
                 args=(_GATHER_WORLD, 29816, False),
+                nprocs=_GATHER_WORLD,
+                join=True,
+            )
+
+
+_SYNC_FREE_SIZE = _GATHER_PAGE_SIZE * 128  # physical token slots per rank
+_SYNC_FREE_BATCHES = 12
+
+
+@contextmanager
+def _no_host_sync():
+    """Raise on any host sync that torch's sync debug mode detects."""
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        yield
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+
+
+def _exact_values(locs, layer_id, width):
+    """bf16-exact rows; two locations of a layer, or two layers of a location,
+    never share a row."""
+    dims = torch.arange(width, device=locs.device)
+    raw = (
+        locs[:, None] * 131
+        + dims * 17
+        + layer_id * 71
+        + (locs[:, None] // 251) * (dims % 7 + 1)
+    )
+    return (raw % 251 - 125).to(_GATHER_DTYPE)
+
+
+def _run_sync_free(rank, world, port, multicast):
+    # The debug owner-congruence checks sync the host by design.
+    os.environ["SGLANG_DEBUG_MEMORY_POOL"] = "0"
+    _dist_init(rank, world, port, attn_cp_size=1)
+
+    group = get_parallel().attn_tp_group
+    ps = _GATHER_PAGE_SIZE
+    spec = PageShardSpec(
+        shard_rank=group.rank_in_group,
+        shard_size=world,
+        page_size=ps,
+        max_prefix_tokens=32 * world * ps,
+        chunk_tokens=16 * ps,
+    )
+    common = dict(
+        page_size=ps,
+        dtype=_GATHER_DTYPE,
+        layer_num=_GATHER_LAYER_NUM,
+        device=f"cuda:{rank}",
+        enable_memory_saver=False,
+        start_layer=0,
+        end_layer=_GATHER_LAYER_NUM - 1,
+    )
+    mla_dims = dict(kv_lora_rank=_GATHER_KV_LORA_RANK, qk_rope_head_dim=_GATHER_QK_ROPE)
+    mha_dims = dict(
+        head_num=_GATHER_HEAD_NUM, head_dim=_GATHER_HEAD_DIM, enable_alt_stream=False
+    )
+    shard = dict(shard_spec=spec, shard_group=group)
+    # Each sharded pool is mirrored by an unsharded pool of the same local
+    # size, written with the compacted nonzero owner filter.
+    mla = PageInterleaveMLATokenToKVPool(_SYNC_FREE_SIZE, **common, **mla_dims, **shard)
+    mla_ref = MLATokenToKVPool(_SYNC_FREE_SIZE, **common, **mla_dims)
+    mha = PageInterleaveMHATokenToKVPool(_SYNC_FREE_SIZE, **common, **mha_dims, **shard)
+    mha_ref = MHATokenToKVPool(_SYNC_FREE_SIZE, **common, **mha_dims)
+    _check_gather_path(mla, multicast)
+    _check_gather_path(mha, multicast)
+    device = mla.kv_buffer[0].device
+    lora = _GATHER_KV_LORA_RANK
+    width = _GATHER_KV_LORA_RANK + _GATHER_QK_ROPE
+    head_shape = (_GATHER_HEAD_NUM, _GATHER_HEAD_DIM)
+    mha_width = _GATHER_HEAD_NUM * _GATHER_HEAD_DIM
+
+    def write_sharded(locs, layer_id):
+        layer = SimpleNamespace(layer_id=layer_id)
+        kv = _exact_values(locs, layer_id, width).unsqueeze(1)
+        k = _exact_values(locs, layer_id + 50, mha_width).view(-1, *head_shape)
+        v = _exact_values(locs, layer_id + 100, mha_width).view(-1, *head_shape)
+        # Even layers take the latent row-scatter kernel, odd layers the
+        # combined-row index_put door.
+        if layer_id % 2 == 0:
+            mla.set_mla_kv_buffer(layer, locs, kv[..., :lora], kv[..., lora:])
+        else:
+            mla.set_kv_buffer(layer, locs, kv, None)
+        mha.set_kv_buffer(layer, locs, k, v)
+        return kv, k, v
+
+    def write_reference(locs, layer_id, kv, k, v):
+        owned = torch.nonzero(mla.placement.local_mask(locs, mla.shard_rank))
+        owned = owned.squeeze(1)
+        if not owned.numel():
+            return
+        rows = mla.placement.local_index(locs[owned])
+        layer = SimpleNamespace(layer_id=layer_id)
+        if layer_id % 2 == 0:
+            mla_ref.set_mla_kv_buffer(
+                layer,
+                rows,
+                kv[..., :lora].index_select(0, owned),
+                kv[..., lora:].index_select(0, owned),
+            )
+        else:
+            mla_ref.set_kv_buffer(layer, rows, kv.index_select(0, owned), None)
+        mha_ref.set_kv_buffer(
+            layer, rows, k.index_select(0, owned), v.index_select(0, owned)
+        )
+
+    # The same seed on every rank keeps the batches mirrored.
+    rng = random.Random(0)
+    for batch in range(_SYNC_FREE_BATCHES):
+        requests = random_shard_batch(rng, world, ps, _SYNC_FREE_SIZE // ps)
+        req_to_token, req_ids = shard_batch_tables(requests, ps, device)
+        prefix_lens = [prefix_len for _, prefix_len, _ in requests]
+        seq_lens = [seq_len for _, _, seq_len in requests]
+        req_locs = [
+            request_locs(pages, seq_len, ps, device) for pages, _, seq_len in requests
+        ]
+        prefix_locs = torch.cat([locs[:p] for locs, p in zip(req_locs, prefix_lens)])
+        chunk_locs = torch.cat([locs[p:] for locs, p in zip(req_locs, prefix_lens)])
+        read_locs = torch.cat(req_locs)
+
+        # Persist the prefix outside an extend, as earlier batches would have.
+        mla.end_shard_extend()
+        mha.end_shard_extend()
+        if prefix_locs.numel():
+            for layer_id in range(_GATHER_LAYER_NUM):
+                write_reference(
+                    prefix_locs, layer_id, *write_sharded(prefix_locs, layer_id)
+                )
+
+        # The first batch JIT-compiles the kernels outside the check.
+        snapshots = []
+        with _no_host_sync() if batch else nullcontext():
+            mla.begin_shard_extend(req_to_token, req_ids, prefix_lens, seq_lens)
+            mha.begin_shard_extend(req_to_token, req_ids, prefix_lens, seq_lens)
+            for layer_id in range(_GATHER_LAYER_NUM):
+                written = None
+                if chunk_locs.numel():
+                    written = write_sharded(chunk_locs, layer_id)
+                layer = SimpleNamespace(layer_id=layer_id)
+                snapshots.append(
+                    (
+                        written,
+                        mla.get_mla_kv_buffer(layer, read_locs),
+                        mla.get_key_buffer(layer_id).clone(),
+                        mha.get_key_buffer(layer_id).clone(),
+                        mha.get_value_buffer(layer_id).clone(),
+                    )
+                )
+
+        send_pages = assert_matches_sorting_plan(
+            mla, req_to_token, req_ids, prefix_lens, seq_lens
+        )
+        assert_matches_sorting_plan(mha, req_to_token, req_ids, prefix_lens, seq_lens)
+        mha_rows = mha.translate_loc_to_scratch(read_locs)
+        for layer_id, (written, latent, kv_scratch, k_scratch, v_scratch) in enumerate(
+            snapshots
+        ):
+            if written is not None:
+                write_reference(chunk_locs, layer_id, *written)
+            expect = _exact_values(read_locs, layer_id, width)
+            _mtp_assert_bytes(latent[0][:, 0], expect[:, :lora], "latent")
+            _mtp_assert_bytes(latent[1][:, 0], expect[:, lora:], "rope")
+            _mtp_assert_bytes(
+                k_scratch[mha_rows],
+                _exact_values(read_locs, layer_id + 50, mha_width).view(
+                    -1, *head_shape
+                ),
+                "mha k scratch",
+            )
+            _mtp_assert_bytes(
+                v_scratch[mha_rows],
+                _exact_values(read_locs, layer_id + 100, mha_width).view(
+                    -1, *head_shape
+                ),
+                "mha v scratch",
+            )
+            if send_pages is None:
+                continue
+            # Every rank's real send pages at their gathered rows; padding
+            # slots hold the never-referenced reserved local page 0.
+            block = send_pages.shape[1]
+            gathered = kv_scratch[: world * block * ps, 0].view(world, block, ps, -1)
+            owners = torch.arange(world, device=device)[:, None]
+            gathered_locs = (send_pages * world + owners)[
+                ..., None
+            ] * ps + torch.arange(ps, device=device)
+            real = send_pages != 0
+            _mtp_assert_bytes(
+                gathered[real],
+                _exact_values(gathered_locs[real].reshape(-1), layer_id, width).view(
+                    -1, ps, width
+                ),
+                "gathered prefix block",
+            )
+
+        # Both doors skip the reserved row 0 that foreign tokens map to.
+        for local_layer in range(_GATHER_LAYER_NUM):
+            _mtp_assert_bytes(
+                mla.kv_buffer[local_layer],
+                mla_ref.kv_buffer[local_layer],
+                f"mla pool layer {local_layer}",
+            )
+            _mtp_assert_bytes(
+                mha.k_buffer[local_layer],
+                mha_ref.k_buffer[local_layer],
+                f"mha k pool layer {local_layer}",
+            )
+            _mtp_assert_bytes(
+                mha.v_buffer[local_layer],
+                mha_ref.v_buffer[local_layer],
+                f"mha v pool layer {local_layer}",
+            )
+
+    torch.distributed.barrier()
+    if rank == 0:
+        print("PASS: sync-free shard plan and writes")
+
+
+@unittest.skipIf(
+    torch.cuda.device_count() < 2, "sync-free shard path test needs 2 CUDA devices"
+)
+class TestSyncFreeShardPathMultiGpu(CustomTestCase):
+    """begin_shard_extend and the sharded write doors issue no host sync, and
+    match the sorting plan and the compacted owner-filtered writes bit for bit
+    on random mirrored batches, through real gathers and kernels."""
+
+    def test_default_gather(self):
+        mp.spawn(
+            _run_sync_free,
+            args=(_GATHER_WORLD, 29823, None),
+            nprocs=_GATHER_WORLD,
+            join=True,
+        )
+
+    def test_nccl_gather(self):
+        with envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.override(False):
+            mp.spawn(
+                _run_sync_free,
+                args=(_GATHER_WORLD, 29824, False),
                 nprocs=_GATHER_WORLD,
                 join=True,
             )
