@@ -26,12 +26,22 @@ opportunistic flushes. After every operation:
 import random
 import unittest
 from array import array
+from contextlib import ExitStack
 from types import SimpleNamespace
 from typing import Dict, List, Optional
+from unittest import mock
 from unittest.mock import MagicMock
 
+import numpy as np
 import torch
 
+from sglang.srt.arg_groups import kv_shard_hook
+from sglang.srt.disaggregation import prefill
+from sglang.srt.disaggregation import utils as disagg_utils
+from sglang.srt.disaggregation.common.conn import CommonKVSender
+from sglang.srt.disaggregation.mooncake.conn import (
+    MooncakeKVManager,
+)
 from sglang.srt.environ import InvariantCheckLevel, envs
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.schedule_policy import PrefillAdder
@@ -53,6 +63,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     evictable_by_sub_pool,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.common import kv_to_page_indices
 from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv.alloc.kv_shard import ShardedOwner
 from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
@@ -908,6 +919,143 @@ class TestEvictionCreditPerClass(CustomTestCase):
                 )
 
 
+class TestShardedSend(CustomTestCase):
+    """A PD send of a request sharded by logical page: each rank sends the
+    pages it owns from where its own layout put them, and the ranks' chunk
+    bookkeeping stays in step."""
+
+    def setUp(self):
+        _signal_invariants(self)
+
+    def test_ranks_send_the_pages_they_own_and_cover_the_request(self):
+        for shard_size in (2, 4):
+            with self.subTest(shard_size=shard_size):
+                group = _ShardGroup(self, shard_size, 3)
+                ranks = group.ranks
+                # Churn first, so that a page's physical place differs by rank.
+                group.run(60)
+                pages = 9
+                ids = None
+                while ids is None:
+                    ids, *_ = group._same(
+                        [
+                            rank.take([(0, pages * PS - 3, None, 0)], [])
+                            for rank in ranks
+                        ],
+                        "the request",
+                    )
+                    if ids is None:
+                        group.free()
+                for rank in ranks:
+                    rank.write(ids)
+                tokens = torch.tensor(ids, dtype=torch.int64)
+                # One page, which a single rank owns, then the rest.
+                segments = [(0, PS), (PS, 5 * PS), (5 * PS, len(ids))]
+                senders = [
+                    SimpleNamespace(
+                        kv_mgr=SimpleNamespace(
+                            kv_shard_size=shard_size,
+                            kv_shard_rank=rank.rank,
+                            kv_shard_rank_local=True,
+                        ),
+                        curr_idx=0,
+                        num_kv_indices=pages,
+                    )
+                    for rank in ranks
+                ]
+                covered = []
+                for start, end in segments:
+                    sent, last = [], []
+                    for rank, sender in zip(ranks, senders):
+                        # The generic send: every page translated (a peer's
+                        # page is the sink), then the sender's shard filter.
+                        translated = kv_to_page_indices(
+                            rank.allocator.translate_kv_indices_for_transfer(
+                                tokens[start:end]
+                            ),
+                            PS,
+                        )
+                        physical, index, is_last, skip = (
+                            CommonKVSender._prepare_send_indices(sender, translated)
+                        )
+                        # Never the sink, and the rows are the ones written
+                        # for those logical pages, wherever compaction left them.
+                        self.assertTrue(bool((physical > 0).all()))
+                        for page, position in zip(physical, index):
+                            first = tokens[int(position) * PS]
+                            self.assertEqual(int(first) // PS % shard_size, rank.rank)
+                            self.assertTrue(
+                                torch.equal(
+                                    rank.rows[int(page) * PS, :4],
+                                    _marker(first.reshape(1))[0],
+                                )
+                            )
+                        sent += np.asarray(index).tolist()
+                        last.append(is_last)
+                        self.assertEqual(skip, len(physical) == 0 and not is_last)
+                    # Every rank advanced alike; the destinations are a partition.
+                    self.assertEqual(last, [end == len(ids)] * shard_size)
+                    self.assertEqual(len({s.curr_idx for s in senders}), 1)
+                    self.assertEqual(
+                        sorted(sent), list(range(start // PS, -(-end // PS)))
+                    )
+                    covered += sent
+                self.assertEqual(sorted(covered), list(range(pages)))
+
+    def test_recurrent_state_goes_to_the_same_rank_only(self):
+        """Every prefill rank sends its KV pages to every decode rank; a
+        rank's recurrent state goes to the decode rank of the same index."""
+        tp = 4
+        for src in range(tp):
+            manager = SimpleNamespace(
+                _should_skip_cp_replicated_state_transfer=lambda: False,
+                is_hybrid_mla_backend=True,
+                kv_shard_size=tp,
+                attn_cp_size=1,
+                attn_tp_size=tp,
+                kv_args=SimpleNamespace(engine_rank=src),
+            )
+            for dst in range(tp):
+                info = SimpleNamespace(dst_tp_rank=dst, dst_attn_tp_size=tp)
+                skip_kv, skip_state = (
+                    MooncakeKVManager._get_dsa_cache_transfer_skip_flags(manager, info)
+                )
+                self.assertFalse(skip_kv)
+                self.assertEqual(skip_state, src != dst)
+            # Unsharded, equal TP maps rank to rank and nothing is skipped.
+            manager.kv_shard_size = 1
+            info = SimpleNamespace(dst_tp_rank=src, dst_attn_tp_size=tp)
+            self.assertEqual(
+                MooncakeKVManager._get_dsa_cache_transfer_skip_flags(manager, info),
+                (False, False),
+            )
+
+    def test_the_sharded_send_waiter_is_rank_local(self):
+        """The ranks of the shard group hold different rows at different
+        places, so a wait one of them enters another may never reach: the
+        waiter reduces over no group, and a wait is a host loop of its own."""
+        scheduler = SimpleNamespace(
+            attn_tp_cpu_group="attn_tp",
+            attn_cp_cpu_group="attn_cp",
+            feed_watchdog=lambda: None,
+        )
+        done = SimpleNamespace(peer=None)
+        with mock.patch.object(
+            disagg_utils, "all_reduce_flags", side_effect=lambda flags, **_: flags
+        ) as reduce:
+            waiter = prefill._send_waiter(scheduler, rank_local=True)
+            self.assertEqual(waiter._groups, [])
+            waiter([done])
+            reduce.assert_not_called()
+            # Unsharded: the attention TP ranks reach every wait together.
+            waiter = prefill._send_waiter(scheduler)
+            self.assertEqual(waiter._groups, ["attn_tp"])
+            waiter([done])
+            self.assertEqual(
+                [c.kwargs["group"] for c in reduce.call_args_list], ["attn_tp"]
+            )
+
+
 class TestShardedChainSurface(CustomTestCase):
     def setUp(self):
         setup_allocator_context()
@@ -1051,6 +1199,73 @@ class TestShardedChainSurface(CustomTestCase):
         self.assertIs(runner_ids.translate_dcp_read_ids(ids), ids)
         with self.assertRaises(AssertionError):
             self.allocator.translate_kv_loc(ids)
+
+
+class TestStartupGate(CustomTestCase):
+    """KV sharding over unified memory supports one shape; each way out of it
+    is refused at startup."""
+
+    SUPPORTED = dict(
+        enable_prefill_cp=False,
+        attn_cp_size=1,
+        pp_size=1,
+        page_size=64,
+        disaggregation_transfer_backend="mooncake",
+        speculative_algorithm=None,
+        enable_hierarchical_cache=False,
+        enable_deterministic_inference=False,
+        disable_chunked_prefix_cache=False,
+        enable_pd_role_switch=False,
+        disaggregation_enable_kv_checksum=False,
+    )
+
+    def _validate(
+        self, *, mla=True, state=True, dsa=False, swa=False, backend="fa3", **cfg
+    ):
+        model_config = SimpleNamespace(hf_config=None, is_hybrid_swa=swa)
+        patches = dict(
+            model_config_of=model_config,
+            use_mla_backend=mla,
+            mambaish_config=object() if state else None,
+            is_deepseek_dsa=dsa,
+            resolved_view=None,
+            attention_backends_of=(backend, None),
+        )
+        with ExitStack() as stack:
+            for name, value in patches.items():
+                stack.enter_context(
+                    mock.patch.object(kv_shard_hook, name, return_value=value)
+                )
+            kv_shard_hook.validate_kv_shard_unified_memory(
+                None, SimpleNamespace(**{**self.SUPPORTED, **cfg})
+            )
+
+    def test_the_supported_shape_passes(self):
+        self._validate()
+        self._validate(backend="trtllm_mla")
+
+    def test_each_way_out_of_the_shape_is_refused(self):
+        for change in (
+            dict(mla=False),
+            dict(state=False),
+            dict(dsa=True),
+            dict(swa=True),
+            dict(backend="flashinfer"),
+            dict(enable_prefill_cp=True),
+            dict(attn_cp_size=2),
+            dict(pp_size=2),
+            dict(page_size=32),
+            dict(disaggregation_transfer_backend="nixl"),
+            dict(speculative_algorithm="EAGLE"),
+            dict(enable_hierarchical_cache=True),
+            dict(enable_deterministic_inference=True),
+            dict(disable_chunked_prefix_cache=True),
+            dict(enable_pd_role_switch=True),
+            dict(disaggregation_enable_kv_checksum=True),
+        ):
+            with self.subTest(**change):
+                with self.assertRaisesRegex(ValueError, "does not support"):
+                    self._validate(**change)
 
 
 class TestShardedViewBackstop(CustomTestCase):

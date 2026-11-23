@@ -2467,6 +2467,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if not self.is_hybrid_mla_backend:
             return skip_kv, skip_state
 
+        if (
+            info is not None
+            and self.kv_shard_size > 1
+            and self.attn_cp_size == 1
+            and info.dst_tp_rank % info.dst_attn_tp_size
+            != self.kv_args.engine_rank % self.attn_tp_size
+        ):
+            # KV-sharded prefill: every decode rank pulls pages from every prefill
+            # rank, but head-partitioned recurrent state goes rank r to rank r.
+            skip_state = True
+
         if info is not None and self.attn_tp_size > info.dst_attn_tp_size:
             sub_rank = (self.kv_args.engine_rank % self.attn_tp_size) % (
                 self.attn_tp_size // info.dst_attn_tp_size

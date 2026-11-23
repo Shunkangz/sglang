@@ -340,6 +340,8 @@ class CommonKVManager(BaseKVManager):
     # every CP rank, but GDN/QSA/PLE state and aux only from its rank-matched
     # one (see _is_request_peer).
     kv_shard_state_peer_only: bool = False
+    # A unified pool sharded by logical page: ids arrive translated to this rank's pages.
+    kv_shard_rank_local: bool = False
 
     # Used by decode when the prefill reported Failed without a reason frame.
     DEFAULT_PREFILL_FAILURE_REASON = (
@@ -408,9 +410,13 @@ class CommonKVManager(BaseKVManager):
         self.pp_rank = self.kv_args.pp_rank
         self.local_ip = get_local_ip_auto()
         if get_parallel().enable_kv_cache_sharding:
-            kv_shard_group = get_kv_shard_group(is_mla_backend)
+            # Hybrid MLA replicates its latent across attention TP as pure MLA does.
+            kv_shard_group = get_kv_shard_group(
+                is_mla_backend or self.is_hybrid_mla_backend
+            )
             self.kv_shard_rank = kv_shard_group.rank_in_group
             self.kv_shard_size = kv_shard_group.world_size
+            self.kv_shard_rank_local = get_memory().enable_unified_memory
         cp_sharded_prefill = self.attn_cp_size > 1 and (
             self.is_hybrid_mla_backend or get_parallel().enable_dsa_cache_layer_split
         )
@@ -2493,6 +2499,7 @@ class CommonKVSender(BaseKVSender):
                 index_slice=index_slice,
                 shard_rank=self.kv_mgr.kv_shard_rank,
                 shard_size=self.kv_mgr.kv_shard_size,
+                rank_local=self.kv_mgr.kv_shard_rank_local,
             )
             # Like the scheduler, skip a non-final chunk with nothing to send.
             if len(kv_indices) == 0 and not is_last_chunk:

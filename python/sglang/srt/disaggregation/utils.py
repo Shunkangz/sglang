@@ -1141,6 +1141,7 @@ def filter_kv_indices_for_shard_rank(
     index_slice: slice,
     shard_rank: int,
     shard_size: int,
+    rank_local: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Logical page l lives on rank l % N as local page l // N; returns the owned
     local ids and their send positions, which replace the contiguous index_slice.
@@ -1150,6 +1151,10 @@ def filter_kv_indices_for_shard_rank(
     # A one-element torch bool tensor is interpreted as an integer index by
     # NumPy. Keep the page ids and their positional mask in the same array type.
     kv_indices = np.asarray(kv_indices)
+    if rank_local:
+        # A unified pool already translated the ids: 0 (the sink) is a peer's page.
+        owned = np.flatnonzero(kv_indices)
+        return kv_indices[owned], owned + index_slice.start
     owned = kv_indices % shard_size == shard_rank
     positions = np.arange(index_slice.start, index_slice.stop, dtype=np.int64)
     return kv_indices[owned] // shard_size, positions[owned]

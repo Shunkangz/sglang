@@ -259,12 +259,12 @@ def _send_done(peer) -> bool:
     return queued <= queued_before or finished > queued_before
 
 
-def _send_waiter(scheduler) -> NetworkTransferWaiter:
+def _send_waiter(scheduler, *, rank_local: bool = False) -> NetworkTransferWaiter:
     """The host waiter for sends, reduced over the attention TP ranks only:
-    they record the same rows and reach each wait together; CP ranks do not."""
-    return NetworkTransferWaiter(
-        _send_done, (scheduler.attn_tp_cpu_group,), heartbeat=scheduler.feed_watchdog
-    )
+    they record the same rows and reach each wait together; CP ranks do not,
+    nor (``rank_local``) the ranks of a KV shard group."""
+    groups = () if rank_local else (scheduler.attn_tp_cpu_group,)
+    return NetworkTransferWaiter(_send_done, groups, heartbeat=scheduler.feed_watchdog)
 
 
 class PrefillBootstrapQueue:
@@ -342,9 +342,11 @@ class PrefillBootstrapQueue:
                     "supported by Mooncake."
                 )
         self.kv_manager = self._init_kv_manager()
+        # Sharded by logical page, each rank holds its own pages and waits alone.
+        rank_local = self.scheduler.kv_shard_widening > 1
         kv_storage_of(
             self.scheduler.req_to_token_pool, self.scheduler.token_to_kv_pool_allocator
-        ).set_network_waiter(_send_waiter(self.scheduler))
+        ).set_network_waiter(_send_waiter(self.scheduler, rank_local=rank_local))
         self.kv_checksum_signature = 0
         if get_disagg().disaggregation_enable_kv_checksum:
             kv_args = self.kv_manager.kv_args
