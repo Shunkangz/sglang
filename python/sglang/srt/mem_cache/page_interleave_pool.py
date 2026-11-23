@@ -73,6 +73,7 @@ from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
 )
 from sglang.kernels.ops.kvcache import dsa_index_k_cache
 from sglang.kernels.ops.kvcache.mla_buffer import get_mla_kv_buffer_triton
+from sglang.kernels.ops.kvcache.pack_rows import pack_rows
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.distributed.device_communicators.gated_transfer import (
     Link,
@@ -560,7 +561,8 @@ class PageInterleaveKVPoolMixin:
                 block = send_rows.numel()
                 output = slot.tensors[name][: self.shard_size * block]
                 send = output[self.shard_rank * block : (self.shard_rank + 1) * block]
-                torch.index_select(pool_buf, 0, send_rows, out=send)
+                # Capped grid: the side-stream pack must not starve compute.
+                pack_rows(src=pool_buf, rows=send_rows, out=send)
                 # In-place regular allgather: send is exactly the rank's
                 # block of the output, every rank contributes `block` rows.
                 if self._multicast_gather is not None:
