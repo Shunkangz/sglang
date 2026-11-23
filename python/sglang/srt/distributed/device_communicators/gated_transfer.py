@@ -67,6 +67,14 @@ How it works:
   queued, behind a pause or a busy link: issue whatever its ops wait on
   first. If the chain's own driver calls fail, it fails for good: its
   pending runs are dropped and raise instead of landing.
+- Copy runs: a run of at most a window of ``CopyChunk``s, issued while the
+  run before the last has landed, skips the window and the feeder thread,
+  whose GIL time slows the thread that launches the forward. ``run``
+  enqueues it whole on the primary stream, two driver calls per chunk: one
+  batch memop (write a count, which lands only once the work before it
+  retired; wait for that count; wait at the gate), then the copy. So a gate
+  is again read only once the chunk before it retired, and no stream waits
+  on work enqueued after it.
 
 Hazards: a parked gate wait holds its stream's hardware queue, and later
 work of every stream mapped to that queue (``CUDA_DEVICE_MAX_CONNECTIONS``)
@@ -96,7 +104,17 @@ import logging
 import threading
 import time
 from contextlib import nullcontext
-from typing import Callable, Deque, List, NoReturn, Optional, Sequence, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Deque,
+    List,
+    NoReturn,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import torch
 
@@ -408,6 +426,16 @@ class TransferChain:
         self._error: Optional[BaseException] = None  # an op's, raised once
         self._failed: Optional[BaseException] = None  # the chain's, for good
         self._gate = None if link is None else _add_chain(link, self.device, self)
+        # Copy runs (_run_copies): a device word each chunk writes, then waits
+        # for ahead of its gate; zeroed before any chain stream can write it.
+        self._done_seq = 0
+        self._memops = None
+        if link is not None:
+            self._done = torch.zeros(
+                1, dtype=torch.int32, device=torch.device("cuda", self.device)
+            )
+            torch.cuda.current_stream(self.device).synchronize()
+            self._memops = self._chunk_memops()
         self._feeder = threading.Thread(
             target=self._feed, name="gated-transfer-feeder", daemon=True
         )
@@ -427,9 +455,10 @@ class TransferChain:
         chunks. Returns its ticket for ``wait`` and ``query``: a 32-bit
         count, valid for the next 2^31 runs.
 
-        Never waits for the GPU or the feeder thread, and enqueues at most a
-        window of ops itself: the feeder thread enqueues the rest, in order,
-        as earlier ones retire. An op that raises skips the rest of its run,
+        Never waits for the GPU or the feeder thread. A copy run (see the
+        module docstring) is enqueued whole here; any other run enqueues at
+        most a window of ops here and the feeder thread enqueues the rest,
+        in order, as earlier ones retire. An op that raises skips the rest of its run,
         whose ticket still lands once the work enqueued before has run; the
         error is raised here, or by the next ``run`` or ``wait`` if the
         feeder thread hit it.
@@ -445,6 +474,10 @@ class TransferChain:
         except IndexError:
             event = _create_event()
         check_drv(cu.cuEventRecord(event, after_handle), "cuEventRecord")
+        if len(chunks) <= _WINDOW and all(type(c) is CopyChunk for c in chunks):
+            ticket = self._run_copies(chunks, setup, finish, event, caller)
+            if ticket is not None:
+                return ticket
         ticket = (self._issued + 1) & 0xFFFFFFFF
         first = 1 + len(setup)
         run = _Run(
@@ -539,6 +572,93 @@ class TransferChain:
             raise RuntimeError(
                 "a gated transfer op failed on the feeder thread"
             ) from error
+
+    def _chunk_memops(self) -> List[Any]:
+        """Reusable batch-memop params for a copy run's chunk: write a count
+        to ``_done`` (ordered after the work before it), wait until it
+        landed, then wait at the gate. The driver reads them at enqueue."""
+        done = self._done.data_ptr()
+        write, landed, gate = (cu.CUstreamBatchMemOpParams() for _ in range(3))
+        write.operation = cu.CUstreamBatchMemOpType.CU_STREAM_MEM_OP_WRITE_VALUE_32
+        write.writeValue.address = done
+        write.writeValue.flags = (
+            cu.CUstreamWriteValue_flags.CU_STREAM_WRITE_VALUE_DEFAULT
+        )
+        for wait in (landed, gate):
+            wait.operation = cu.CUstreamBatchMemOpType.CU_STREAM_MEM_OP_WAIT_VALUE_32
+        landed.waitValue.address = done
+        landed.waitValue.flags = cu.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_GEQ
+        gate.waitValue.address = self._gate.address
+        gate.waitValue.value = 0
+        gate.waitValue.flags = cu.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_EQ
+        return [write, landed, gate]
+
+    def _run_copies(self, chunks, setup, finish, event, caller) -> Optional[int]:
+        """Enqueue a copy run whole on this thread, on the primary stream.
+        Returns None, leaving the run to the feeder path, behind runs
+        still pending, while the run before the last is in flight (bounding
+        what stays queued on the GPU), or inside this thread's own pause of
+        this chain."""
+        gate = self._gate
+        if gate is not None and gate._pause_thread == threading.get_ident():
+            return None
+        if not self._submitting.acquire(blocking=False):  # the feeder is busy
+            return None
+        try:
+            with self._lock:
+                if self._failed is not None:
+                    self._raise_failed()
+                if self._pending or not _reached(
+                    self._landed.value, (self._issued - 1) & 0xFFFFFFFF
+                ):
+                    return None
+                ticket = (self._issued + 1) & 0xFFFFFFFF
+                self._issued = ticket
+            try:
+                error = self._enqueue_copies(chunks, setup, finish, event, ticket)
+            except BaseException as e:  # the chain's own driver calls
+                self._fail(e)
+                raise
+            finally:
+                torch.cuda.set_stream(caller)
+            with self._lock:
+                self._enqueued_run = ticket
+                self._run_enqueued.notify_all()
+            if error is not None:
+                raise error
+            return ticket
+        finally:
+            self._submitting.release()
+
+    def _enqueue_copies(self, chunks, setup, finish, event, ticket):
+        """All on the primary stream; each chunk behind its batch memop
+        (``_gate_chunk``). As on the generic path, an op that raises skips
+        the rest of the run but the ticket write, and is returned; the
+        chain's own driver calls raise."""
+        handle, primary = self._handles[0], self._streams[0]
+        self._wait_after(event, primary)
+        torch.cuda.set_stream(primary)
+        first, end = len(setup), len(setup) + len(chunks)
+        error = None
+        for i, op in enumerate((*setup, *chunks, *finish)):
+            if first <= i < end and self._memops is not None:
+                self._gate_chunk(handle)
+            try:
+                op(primary)
+            except BaseException as e:  # SystemExit too, as in _enqueue
+                error = e
+                break
+        self._write_ticket(ticket, primary)
+        self._stream = 0  # the generic path's next op follows this run here
+        return error
+
+    def _gate_chunk(self, handle) -> None:
+        self._done_seq = (self._done_seq + 1) & 0xFFFFFFFF
+        ops = self._memops
+        ops[0].writeValue.value = ops[1].waitValue.value = self._done_seq
+        result = cu.cuStreamBatchMemOp(handle, 3, ops, 0)
+        if result[0]:
+            check_drv(result, "chunk gate (cuStreamBatchMemOp)")
 
     def _enqueue_pending(
         self, block: bool, budget: Optional[int] = None
