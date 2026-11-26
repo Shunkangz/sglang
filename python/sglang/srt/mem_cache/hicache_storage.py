@@ -54,6 +54,7 @@ class HiCacheStorageConfig:
 
     # Whole-page replication can differ from the target's attention layout.
     rank_replicated: Optional[bool] = None
+    unified_head_writer: bool = True
 
     def __post_init__(self):
         if self.dcp_size < 1 or not 0 <= self.dcp_rank < self.dcp_size:
@@ -85,12 +86,15 @@ class HiCacheStorageConfig:
     def is_storage_writer(self) -> bool:
         """Select one writer for each shared storage object.
 
-        Unified full-page CP replicas share keys and use CP rank 0. Legacy
+        Unified full-page CP replicas share keys and use CP rank 0. Within
+        it, one attention-TP replica writes each GQA/MQA head shard. Legacy
         keys include the CP rank, so every CP copy retains its own writer.
         MLA uses one writer per DCP shard in the first DCP group; with DCP
         disabled, MLA uses TP rank 0 and non-MLA uses every TP rank.
         """
-        if self.unified_suffixes is not None and self.attn_cp_rank != 0:
+        if self.unified_suffixes is not None and (
+            self.attn_cp_rank != 0 or not self.unified_head_writer
+        ):
             return False
         return not self.is_rank_replicated or self.tp_rank == self.dcp_rank
 

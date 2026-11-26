@@ -62,6 +62,23 @@ Guidelines:
 - `page_first`: Only compatible with `kernel` I/O backend, automatically switches to `layer_first` with `direct` backend
 - `page_first_direct`: Specifically designed for `direct` I/O backend with optimized memory organization
 
+### Replicated prefill CP with the unified HiCache layout
+
+With zigzag prefill CP, the attention ranks gather the new KV rows in sequence order. Each CP rank can back up a complete token page to its own L2 host pool and restore that page after GPU eviction. On a Linux host with two NVIDIA Hopper GPUs, you can enable this layout for Qwen3 with the following command.
+
+```bash
+sglang serve Qwen/Qwen3-0.6B \
+  --tp-size 2 --attn-cp-size 2 --enable-prefill-cp --cp-strategy zigzag \
+  --attention-backend fa3 --page-size 128 --enable-hierarchical-cache \
+  --hicache-mem-layout page_unified --hicache-io-backend kernel
+```
+
+On B200, use `--attention-backend fa4` with the same page size. For file-backed L3, add `--hicache-storage-backend file --hicache-storage-key-scheme unified` and point `SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR` on each instance at the same directory. For a shared Mooncake store, use `--hicache-storage-backend mooncake --hicache-storage-key-scheme unified`. Both backends support a single MHA/GQA or MLA KV pool.
+
+Within each attention replica, CP rank 0 publishes the L3 chunks. When attention TP also replicates a KV head, one of those TP ranks writes it. A server with a different prefill CP size can read the same chunks. For reuse across different attention-TP or PP splits, set the same `--hicache-storage-head-partition` and `--hicache-storage-layer-partition` on both servers so their local pages tile the same chunks. A head partition of `1` works for GQA deployments that replicate individual KV heads.
+
+Older writers that counted TP copies as separate KV heads used a different L3 namespace. Pages from those writers produce a cache miss and are recomputed on first use.
+
 ### Heterogeneous TP Support (GQA/MHA models)
 
 HiCache storage supports cross-cluster KV reuse when different deployments use different TP sizes (for example, `tp=4` and `tp=8`) and share the same storage backend namespace.

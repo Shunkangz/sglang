@@ -116,6 +116,29 @@ def _plan(**overrides):
 
 
 class TestUnifiedKeyGrid(CustomTestCase):
+    def test_replicated_kv_heads_cover_the_same_grid_as_prefill_cp(self):
+        for heads in (1, 2):
+            with self.subTest(heads=heads):
+                cp = _plan(
+                    local_kv_heads=heads,
+                    total_kv_heads=heads,
+                    attn_tp_rank=0,
+                    attn_tp_size=1,
+                    attn_cp_size=4,
+                    head_group=1,
+                )
+                for rank in range(4):
+                    tp = _plan(
+                        local_kv_heads=1,
+                        total_kv_heads=heads,
+                        attn_tp_rank=rank,
+                        attn_tp_size=4,
+                    )
+                    replicas = 4 // heads
+                    self.assertEqual(tp.namespace, cp.namespace)
+                    self.assertEqual(tp.suffixes, [cp.suffixes[rank // replicas]])
+                    self.assertEqual(tp.is_head_writer, rank % replicas == 0)
+
     def test_tp_shards_of_one_grid_cover_each_other(self):
         """TP2's objects are exactly the union of TP4's, in order.
 
@@ -370,6 +393,20 @@ class TestNamespaceIdentity(CustomTestCase):
 
 
 class TestUnifiedKeySchemeRejections(CustomTestCase):
+    def test_physical_pool_must_match_model_head_shards(self):
+        for heads, local_heads in [(0, 1), (3, 1), (8, 1), (2, 2)]:
+            with (
+                self.subTest(heads=heads, local_heads=local_heads),
+                self.assertRaisesRegex(ValueError, "do not match the host pool"),
+            ):
+                _plan(
+                    total_kv_heads=heads,
+                    local_kv_heads=local_heads,
+                    attn_tp_rank=0,
+                    attn_tp_size=4,
+                    head_group=1,
+                )
+
     def test_head_group_must_tile_this_ranks_heads(self):
         with self.assertRaisesRegex(ValueError, "must divide this rank's"):
             _plan(local_kv_heads=3, attn_tp_rank=0, attn_tp_size=2, head_group=2)

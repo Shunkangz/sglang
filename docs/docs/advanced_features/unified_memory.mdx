@@ -88,17 +88,6 @@ python3 -m sglang.launch_server \
 
 `MODEL_PATH` is a Hugging Face repo id or local path of a supported hybrid model.
 
-### Kimi-Linear with prefill context parallelism
-
-On a Linux host with two NVIDIA Hopper GPUs, you can run Kimi-Linear with zigzag prefill CP and the unified KV layout. Each GPU computes attention for its share of the prompt. The ranks gather the new MLA KV rows in sequence order, then each writes a full copy into its local page-major pool. Tensor parallelism partitions the recurrent state across the two GPUs.
-
-```bash
-sglang serve --model-path moonshotai/Kimi-Linear-48B-A3B-Instruct \
-  --trust-remote-code --tp-size 2 --attn-cp-size 2 \
-  --enable-prefill-cp --cp-strategy zigzag \
-  --attention-backend fa3 --enable-unified-memory
-```
-
 ## Flags and environment variables
 
 | Flag or variable | Effect under unified memory |

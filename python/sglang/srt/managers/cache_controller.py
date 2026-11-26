@@ -52,7 +52,7 @@ from sglang.srt.mem_cache.hicache_key_scheme import (
 from sglang.srt.mem_cache.kv.memory.views import KVLayoutView, MLAKVView
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.utils import get_storage_hash_str
-from sglang.srt.runtime_context import get_memory, get_parallel
+from sglang.srt.runtime_context import get_memory, get_parallel, process_model_config
 from sglang.srt.utils import get_device_module
 from sglang.srt.utils.device import async_h2d_tensor
 
@@ -992,6 +992,7 @@ class HiCacheController:
             extra_config=storage_backend_extra_config,
             unified_suffixes=(unified_plan.suffixes if unified_plan else None),
             unified_chunk_spans=unified_chunk_spans,
+            unified_head_writer=unified_plan is None or unified_plan.is_head_writer,
             dcp_size=dcp_size,
             dcp_rank=get_parallel().attn_dcp_rank,
             logical_page_size=self.page_size if dcp_size > 1 else None,
@@ -1032,13 +1033,22 @@ class HiCacheController:
                 "The unified key scheme does not support decode context "
                 "parallelism: storage objects must contain full pages."
             )
+        rank_replicated = isinstance(device_pool, MLAKVView)
+        total_kv_heads = (
+            0 if rank_replicated else process_model_config().get_total_num_kv_heads()
+        )
+        if total_kv_heads is None:
+            raise ValueError(
+                "Unified storage requires the model's total KV head count."
+            )
         plan = plan_unified_kv(
             model_id=model_name or "",
             # Logical KV dtype, not the storage view: fp8 variants all store as
             # uint8 but must land in distinct keyspaces.
             dtype=normalize_dtype(device_pool.dtype),
             page_size=self.page_size,
-            rank_replicated=isinstance(device_pool, MLAKVView),
+            rank_replicated=rank_replicated,
+            total_kv_heads=total_kv_heads,
             local_kv_heads=getattr(host_pool, "head_num", 0),
             attn_tp_rank=parallel.attn_tp_rank,
             attn_tp_size=parallel.attn_tp_size,

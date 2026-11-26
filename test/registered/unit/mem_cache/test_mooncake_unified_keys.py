@@ -138,8 +138,10 @@ class _Rank:
         end_layer=LAYERS,
         pp_rank=0,
         pp_size=1,
+        cp_rank=0,
+        cp_size=1,
     ):
-        local_heads = 1 if mla else TOTAL_KV_HEADS // tp_size
+        local_heads = 1 if mla else max(1, TOTAL_KV_HEADS // tp_size)
         groups = 1 if mla else local_heads // head_partition
         self.start_layer = start_layer
         self.end_layer = end_layer
@@ -157,25 +159,26 @@ class _Rank:
             dtype="bfloat16",
             page_size=PAGE_SIZE,
             rank_replicated=mla,
+            total_kv_heads=0 if mla else TOTAL_KV_HEADS,
             local_kv_heads=0 if mla else local_heads,
             attn_tp_rank=tp_rank,
             attn_tp_size=tp_size,
-            attn_cp_size=1,
+            attn_cp_size=cp_size,
             start_layer=start_layer,
             end_layer=end_layer,
             is_final_stage=pp_rank == pp_size - 1,
             head_group=None if mla else head_partition,
             layer_partition=layer_partition,
         )
-        self.first_head = tp_rank * local_heads
+        self.first_head = tp_rank * TOTAL_KV_HEADS // tp_size
         self.pool = _UnifiedHostPool(self.layout)
         config = HiCacheStorageConfig(
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            tp_rank=cp_rank * tp_size + tp_rank,
+            tp_size=cp_size * tp_size,
             pp_rank=pp_rank,
             pp_size=pp_size,
-            attn_cp_rank=0,
-            attn_cp_size=1,
+            attn_cp_rank=cp_rank,
+            attn_cp_size=cp_size,
             is_mla_model=mla,
             enable_storage_metrics=False,
             is_page_first_layout=False,
@@ -187,6 +190,7 @@ class _Rank:
             },
             unified_suffixes=self.plan.suffixes,
             unified_chunk_spans=self.plan.chunk_spans(self.layout),
+            unified_head_writer=self.plan.is_head_writer,
         )
         with patch.dict("sys.modules", _fake_mooncake_modules(cluster)):
             from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
@@ -233,6 +237,46 @@ def _logical_pages(mla, count):
 
 
 class TestMooncakeUnifiedKeys(CustomTestCase):
+    def test_replicated_prefill_cp_pages_restore_on_all_tp_head_replicas(self):
+        cluster = _FakeCluster()
+        pages = _logical_pages(mla=False, count=1)
+        for cp_rank in range(2):
+            for tp_rank in range(2):
+                rank = _Rank(
+                    cluster,
+                    mla=False,
+                    tp_rank=tp_rank,
+                    tp_size=2,
+                    cp_rank=cp_rank,
+                    cp_size=2,
+                    head_partition=1,
+                )
+                rank.fill_from(pages, host_pages=[1])
+                if rank.store.storage_config.is_storage_writer:
+                    self.assertEqual(
+                        rank.store.batch_set_v1(["page"], _page_indices([1])), [True]
+                    )
+
+        # The TP-only reader replicates each logical head over two ranks.
+        for tp_rank in range(2 * TOTAL_KV_HEADS):
+            with self.subTest(tp_rank=tp_rank):
+                reader = _Rank(
+                    cluster,
+                    mla=False,
+                    tp_rank=tp_rank,
+                    tp_size=2 * TOTAL_KV_HEADS,
+                    head_partition=1,
+                )
+                self.assertEqual(reader.store.batch_exists(["page"]), 1)
+                self.assertEqual(
+                    reader.store.batch_get_v1(["page"], _page_indices([2])), [True]
+                )
+                self.assertTrue(
+                    torch.equal(
+                        reader.pool.kv_buffer[2], reader.expected_page(pages[0])
+                    )
+                )
+
     def test_tp2_writers_fill_a_tp1_readers_page_blocks(self):
         """Cross-TP reuse at the byte level: TP2's chunks tile TP1's pages.
 

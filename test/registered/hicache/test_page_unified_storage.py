@@ -1,4 +1,4 @@
-"""Reuse page_unified L3 objects across independent TP/CP server instances.
+"""Restore page_unified KV from L2 under CP and share L3 objects across instances.
 
 Run with four CUDA GPUs. SGLANG_TEST_PAGE_UNIFIED_MODEL can point at a local
 Qwen3-0.6B checkpoint. These smoke cases keep attention-TP and PP layer ranges
@@ -19,6 +19,7 @@ from pathlib import Path
 
 import requests
 
+from sglang.srt.utils.device import is_sm100_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kl_test_utils import compare_kl_divergence
 from sglang.test.test_utils import (
@@ -29,16 +30,16 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=360, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=450, stage="extra-b", runner_config="4-gpu-h100")
 
 
 class TestPageUnifiedStorage(CustomTestCase):
     model = "Qwen/Qwen3-0.6B"
-    page_size = 64
+    page_size = 128
     prompt_tokens = 1024
 
     @contextmanager
-    def _server(self, work_dir, *, pp_size, cp_size, label):
+    def _server(self, work_dir, *, pp_size, cp_size, label, use_l3=True):
         base_url = f"http://127.0.0.1:{find_available_port(23337)}"
         args = [
             "--tp-size",
@@ -46,7 +47,7 @@ class TestPageUnifiedStorage(CustomTestCase):
             "--pp-size",
             str(pp_size),
             "--attention-backend",
-            "fa3",
+            "fa4" if is_sm100_supported() else "fa3",
             "--mem-fraction-static",
             "0.6",
             "--max-total-tokens",
@@ -68,14 +69,17 @@ class TestPageUnifiedStorage(CustomTestCase):
             "kernel",
             "--hicache-mem-layout",
             "page_unified",
-            "--hicache-storage-key-scheme",
-            "unified",
-            "--hicache-storage-backend",
-            "file",
-            "--hicache-storage-prefetch-policy",
-            "wait_complete",
             "--enable-cache-report",
         ]
+        if use_l3:
+            args += [
+                "--hicache-storage-key-scheme",
+                "unified",
+                "--hicache-storage-backend",
+                "file",
+                "--hicache-storage-prefetch-policy",
+                "wait_complete",
+            ]
         if cp_size > 1:
             args += [
                 "--attn-cp-size",
@@ -104,15 +108,15 @@ class TestPageUnifiedStorage(CustomTestCase):
             finally:
                 terminate_and_kill_process_tree(process, wait_timeout=60)
 
-    def _generate(self, base_url, input_ids, *, cache_salt=None):
+    def _generate(self, base_url, input_ids, *, cache_salt=None, continuation=()):
         response = requests.post(
             f"{base_url}/generate",
             json={
-                "input_ids": input_ids,
+                "input_ids": [*input_ids, *continuation],
                 "cache_salt": cache_salt,
                 "sampling_params": {
                     "temperature": 0,
-                    "max_new_tokens": 8,
+                    "max_new_tokens": 1 if continuation else 8,
                     "ignore_eos": True,
                 },
                 "return_logprob": True,
@@ -146,8 +150,12 @@ class TestPageUnifiedStorage(CustomTestCase):
             with self._server(
                 work_dir, pp_size=pp_size, cp_size=writer_cp, label="writer"
             ) as base_url:
-                initial = self._generate(base_url, input_ids)
-                self.assertEqual(initial["meta_info"]["cached_tokens"], 0)
+                initial = self._generate(base_url, input_ids)["meta_info"]
+                self.assertEqual(initial["cached_tokens"], 0)
+                continuation = [
+                    token for _, token, _ in initial["output_token_logprobs"]
+                ]
+                self.assertEqual(len(continuation), 8)
                 self._wait_for_backup(work_dir, pp_size)
 
             # This is a fresh process with fresh GPU and host pools. Its first
@@ -155,35 +163,43 @@ class TestPageUnifiedStorage(CustomTestCase):
             with self._server(
                 work_dir, pp_size=pp_size, cp_size=reader_cp, label="reader"
             ) as base_url:
-                cached = self._generate(base_url, input_ids)
-                details = cached["meta_info"]["cached_tokens_details"]
+                # Score the same continuation under both topologies: a BF16
+                # tie can change a greedy token and all tokens that follow it.
+                cached = self._generate(base_url, input_ids, continuation=continuation)[
+                    "meta_info"
+                ]
+                details = cached["cached_tokens_details"]
                 self.assertEqual(details["device"], 0)
                 self.assertEqual(details["host"], 0)
                 self.assertEqual(details["storage_backend"], "HiCacheFile")
                 self.assertGreaterEqual(
                     details["storage"], self.prompt_tokens - self.page_size
                 )
-                self.assertEqual(
-                    cached["meta_info"]["cached_tokens"], details["storage"]
-                )
+                self.assertEqual(cached["cached_tokens"], details["storage"])
 
-                # A new namespace forces fresh computation on the reader.
-                # Imported KV retains the writer's BF16 reduction differences,
-                # so use the existing CP/PP HiCache KL tolerance below.
-                fresh = self._generate(
+                # Build a reference prefix on the reader and reuse it from L1.
+                cold = self._generate(
                     base_url, input_ids, cache_salt="fresh-reference"
-                )
-                self.assertEqual(fresh["meta_info"]["cached_tokens"], 0)
-                cached_probs = cached["meta_info"]["output_token_logprobs"]
-                fresh_probs = fresh["meta_info"]["output_token_logprobs"]
-                self.assertEqual(len(cached_probs), 8)
-                self.assertEqual(len(fresh_probs), 8)
+                )["meta_info"]
+                self.assertEqual(cold["cached_tokens"], 0)
+                resident = self._generate(
+                    base_url,
+                    input_ids,
+                    cache_salt="fresh-reference",
+                    continuation=continuation,
+                )["meta_info"]
+                self.assertEqual(resident["cached_tokens"], details["storage"])
                 self.assertEqual(
-                    [entry[1] for entry in cached_probs],
-                    [entry[1] for entry in fresh_probs],
+                    resident["cached_tokens_details"]["device"], details["storage"]
                 )
+                # The first entry is the prompt's last token, which has no
+                # preceding logprob at logprob_start_len.
+                cached_probs = cached["input_token_logprobs"][1:]
+                resident_probs = resident["input_token_logprobs"][1:]
+                self.assertEqual([entry[1] for entry in cached_probs], continuation)
+                self.assertEqual([entry[1] for entry in resident_probs], continuation)
                 compare_kl_divergence(
-                    [[entry[0] for entry in fresh_probs]],
+                    [[entry[0] for entry in resident_probs]],
                     [[entry[0] for entry in cached_probs]],
                     {self.model: {"kl_div": 0.005}},
                     self.model,
@@ -191,7 +207,7 @@ class TestPageUnifiedStorage(CustomTestCase):
                 )
                 print(
                     f"PP={pp_size}, CP={writer_cp}->{reader_cp}: "
-                    f"{details['storage']} L3 tokens; output/logprobs match"
+                    f"{details['storage']} L3 tokens, continuation logprobs match"
                 )
             succeeded = True
         finally:
@@ -205,6 +221,44 @@ class TestPageUnifiedStorage(CustomTestCase):
 
     def test_cp_to_tp_with_pp(self):
         self._assert_cross_instance_reuse(pp_size=2, writer_cp=2, reader_cp=1)
+
+    def test_cp_restores_prefix_from_host(self):
+        rng = random.Random(39728)
+        prefix = [rng.randint(100, 30000) for _ in range(self.prompt_tokens)]
+        continuation = prefix + [rng.randint(100, 30000) for _ in range(193)]
+        with tempfile.TemporaryDirectory(prefix="page_unified_l2_") as work_dir:
+            with self._server(
+                Path(work_dir), pp_size=1, cp_size=2, label="l2", use_l3=False
+            ) as base_url:
+                # Use independent prefixes with identical contents so both
+                # continuations compute the same suffix under zigzag CP.
+                self._generate(base_url, prefix, cache_salt="resident")
+                resident = self._generate(
+                    base_url, continuation, cache_salt="resident"
+                )["meta_info"]
+                self.assertEqual(
+                    resident["cached_tokens_details"]["device"], len(prefix)
+                )
+                seed = self._generate(base_url, prefix, cache_salt="offloaded")
+                self.assertEqual(seed["meta_info"]["cached_tokens"], 0)
+
+                # Two unrelated 4096-token prompts fill the 8192-token device
+                # pool, while both target prefixes fit within the 2x host pool.
+                for _ in range(2):
+                    filler = [rng.randint(100, 30000) for _ in range(4096)]
+                    self._generate(base_url, filler)
+
+                restored = self._generate(
+                    base_url, continuation, cache_salt="offloaded"
+                )["meta_info"]
+                details = restored["cached_tokens_details"]
+                self.assertEqual(details["device"], 0)
+                self.assertEqual(details["host"], len(prefix))
+                self.assertEqual(restored["cached_tokens"], details["host"])
+                self.assertEqual(
+                    restored["output_token_logprobs"],
+                    resident["output_token_logprobs"],
+                )
 
 
 if __name__ == "__main__":

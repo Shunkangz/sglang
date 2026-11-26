@@ -198,6 +198,8 @@ class UnifiedKVPlan(msgspec.Struct, frozen=True, kw_only=True):
     layer_ranges: list[tuple[int, int]]
     # Head groups, or a single whole-pool range for rank-replicated pools.
     head_ranges: list[tuple[int, int]]
+    # One attention-TP rank per GQA/MQA head shard publishes its chunks.
+    is_head_writer: bool = True
 
     @property
     def head_group_num(self) -> int:
@@ -234,6 +236,7 @@ def plan_unified_kv(
     start_layer: int,
     end_layer: int,
     is_final_stage: bool,
+    total_kv_heads: int | None = None,
     head_group: int | None = None,
     layer_partition: int | None = None,
 ) -> UnifiedKVPlan:
@@ -248,14 +251,40 @@ def plan_unified_kv(
     # attention-TP shard. DCP's token slices are rejected during configuration.
     if attn_cp_size < 1:
         raise ValueError(f"attn_cp_size must be positive: {attn_cp_size}")
+    if not 0 <= attn_tp_rank < attn_tp_size:
+        raise ValueError(f"invalid attention-TP rank {attn_tp_rank} of {attn_tp_size}")
     if not 0 <= start_layer < end_layer:
         raise ValueError(f"invalid layer range [{start_layer}, {end_layer}).")
 
-    total_kv_heads = 0 if rank_replicated else local_kv_heads * attn_tp_size
+    replicas = 1
+    if rank_replicated:
+        total_kv_heads = 0
+    else:
+        if total_kv_heads is None:
+            # Callers without model geometry historically used an explicit
+            # partition to declare that their one-head ranks were sharded.
+            if local_kv_heads == 1 and attn_tp_size > 1 and head_group is None:
+                raise NotImplementedError(
+                    "A single KV head per rank requires the model's total KV head "
+                    "count or an explicit head partition for unreplicated heads."
+                )
+            total_kv_heads = local_kv_heads * attn_tp_size
+        # QKVParallelLinear assigns contiguous blocks of TP ranks to the
+        # same KV head when there are fewer KV heads than attention-TP ranks.
+        shards = min(attn_tp_size, total_kv_heads)
+        if (
+            shards <= 0
+            or attn_tp_size % shards
+            or local_kv_heads * shards != total_kv_heads
+        ):
+            raise ValueError(
+                f"The {total_kv_heads} model KV heads do not match the host pool's "
+                f"{local_kv_heads} heads per rank at attention TP {attn_tp_size}."
+            )
+        replicas = attn_tp_size // shards
     resolved_head_group = _resolve_head_group(
         rank_replicated=rank_replicated,
         local_kv_heads=local_kv_heads,
-        attn_tp_size=attn_tp_size,
         total_kv_heads=total_kv_heads,
         head_group=head_group,
     )
@@ -287,7 +316,7 @@ def plan_unified_kv(
             f"head_group={resolved_head_group}."
         )
     groups_per_rank = local_kv_heads // resolved_head_group
-    first_head_index = attn_tp_rank * groups_per_rank
+    first_head_index = (attn_tp_rank // replicas) * groups_per_rank
     return UnifiedKVPlan(
         namespace=namespace,
         # Layer-major / head-minor, the order the page block packs them in.
@@ -301,6 +330,7 @@ def plan_unified_kv(
             (i * resolved_head_group, (i + 1) * resolved_head_group)
             for i in range(groups_per_rank)
         ],
+        is_head_writer=attn_tp_rank % replicas == 0,
     )
 
 
@@ -308,36 +338,23 @@ def _resolve_head_group(
     *,
     rank_replicated: bool,
     local_kv_heads: int,
-    attn_tp_size: int,
     total_kv_heads: int,
     head_group: int | None,
 ) -> int:
     if rank_replicated:
         return 0
     if head_group is None:
-        if local_kv_heads == 1 and attn_tp_size > 1:
-            # Ambiguous: 1 head/rank could equally mean kv-head replication,
-            # where two ranks hold the same head and would race on one key.
-            # An explicit head_group is the operator attesting it is sharding.
-            raise NotImplementedError(
-                "the unified key scheme cannot derive a namespace at 1 kv head "
-                "per rank; set --hicache-storage-head-partition, or use "
-                "--hicache-storage-key-scheme rank-suffix."
-            )
         if local_kv_heads != total_kv_heads:
-            # Correct but unshareable: another attn-TP size derives a different
-            # digest and misses everything. Nothing else reports this -- the
-            # symptom is a 0% hit rate against a populated store.
+            # A deployment with a different default head-group width derives
+            # a different digest and misses the existing objects.
             logger.warning(
                 "unified key scheme: --hicache-storage-head-partition is unset, so "
                 "this namespace is keyed to this rank's %d of %d kv heads and "
-                "can only share objects with deployments at attn-TP %d. Set it "
-                "to total_kv_heads / lcm of the fleet's attn-TP sizes to share "
-                "across TP sizes; a rank owning several groups simply owns "
-                "several chunks.",
+                "can only share objects with deployments using that group width. "
+                "Set it to a divisor of every deployment's local KV head count "
+                "to share across TP sizes.",
                 local_kv_heads,
                 total_kv_heads,
-                attn_tp_size,
             )
         return local_kv_heads
     if head_group <= 0:
@@ -345,9 +362,8 @@ def _resolve_head_group(
     if local_kv_heads % head_group != 0 or head_group > local_kv_heads:
         raise ValueError(
             f"head_group={head_group} must divide this rank's {local_kv_heads} "
-            f"kv heads. As a fleet grid it must divide every member's local "
-            f"kv-head count, so pick total_kv_heads / lcm(the fleet's attn-TP "
-            f"sizes) -- here total_kv_heads={total_kv_heads}."
+            "kv heads. As a fleet grid it must divide every member's local "
+            "kv-head count."
         )
     return head_group
 

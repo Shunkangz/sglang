@@ -240,13 +240,11 @@ class Memory(msgspec.Struct):
         Arg(
             help=(
                 "KV heads per L3 chunk under --hicache-storage-key-scheme "
-                "unified. A FLEET-WIDE agreement, not a local tuning knob: it "
-                "fixes chunk boundaries, and the boundaries are part of the key "
-                "namespace. Set it to total_kv_heads divided by the lcm of the "
-                "attention-TP sizes in the fleet, so every member's local head "
-                "count is a whole number of chunks. Unset, each deployment keys "
-                "to its own head count and shares only with its own TP size. "
-                "MLA-family models replicate KV across ranks and ignore it."
+                "unified. Use the same value on all instances sharing the cache. "
+                "It must divide the number of KV heads stored by each attention-TP "
+                "rank. Use 1 when a KV head is replicated across attention-TP "
+                "ranks. Defaults to the local KV head count. MLA models ignore "
+                "this setting."
             ),
         ),
     ] = None

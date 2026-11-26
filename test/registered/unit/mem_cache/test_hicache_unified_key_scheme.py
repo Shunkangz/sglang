@@ -131,6 +131,14 @@ class TestUnifiedKeySchemeArgs(CustomTestCase):
 
 
 class TestControllerUnifiedKeys(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        model = self.enterContext(
+            patch("sglang.srt.managers.cache_controller.process_model_config")
+        ).return_value
+        self.get_total_kv_heads = model.get_total_num_kv_heads
+        self.get_total_kv_heads.return_value = 8
+
     def _controller(self, *, mla=False, grouped=True):
         device_pool = object.__new__(MLATokenToKVPool) if mla else SimpleNamespace()
         # FP8 variants share a uint8 storage view but require distinct keys.
@@ -248,6 +256,68 @@ class TestControllerUnifiedKeys(CustomTestCase):
         controller.storage_host_pool.dcp_size = 2
         with self.assertRaisesRegex(NotImplementedError, "decode context parallelism"):
             self._suffixes(controller)
+
+    def test_unknown_model_head_count_is_refused(self):
+        self.get_total_kv_heads.return_value = None
+        with self.assertRaisesRegex(ValueError, "model's total KV head count"):
+            self._suffixes(self._controller())
+
+    def test_replicated_head_writer_uses_attention_tp_and_cp_rank(self):
+        controller = self._controller(grouped=False)
+        host_pool = controller.storage_host_pool
+        host_pool.layout = "page_unified"
+        host_pool.head_num = 1
+        host_pool.storage_format_tag = None
+        host_pool.page_unified_layout = PageUnifiedLayout(
+            page_size=16,
+            layer_num=4,
+            head_num=1,
+            head_group_num=1,
+            head_dim=128,
+            itemsize=1,
+        )
+        controller.enable_storage_metrics = False
+        self.get_total_kv_heads.return_value = 2
+        memory = SimpleNamespace(
+            hicache_storage_key_scheme="unified",
+            hicache_storage_head_partition=None,
+            hicache_storage_layer_partition=4,
+        )
+        topology = SimpleNamespace(
+            tp_size=8,
+            attn_tp_size=4,
+            attn_dcp_rank=0,
+            attn_dcp_size=1,
+            pp_rank=0,
+            pp_size=1,
+        )
+        writers = []
+        with (
+            patch(
+                "sglang.srt.managers.cache_controller.get_memory", return_value=memory
+            ),
+            patch(
+                "sglang.srt.managers.cache_controller.get_parallel",
+                return_value=topology,
+            ),
+            patch(
+                "sglang.srt.managers.cache_controller.is_dp_attention_enabled",
+                return_value=False,
+            ),
+            patch.object(controller, "get_attn_cp_rank_and_size") as cp_group,
+        ):
+            for cp_rank in range(2):
+                cp_group.return_value = (cp_rank, 2)
+                for rank in range(4):
+                    topology.attn_tp_rank = rank
+                    topology.tp_rank = 4 * cp_rank + rank
+                    config = controller._generate_storage_config("org/model")
+                    self.assertTrue(
+                        config.unified_suffixes[0].endswith(f"_H{rank // 2}")
+                    )
+                    if config.is_storage_writer:
+                        writers.append((cp_rank, rank))
+        self.assertEqual(writers, [(0, 0), (0, 2)])
 
     def test_cp_writer_election_preserves_each_attention_tp_shard(self):
         # With attention DP, the storage TP rank is attention-group-local.
