@@ -513,199 +513,230 @@ __global__ void load_cache_to_device_buffer_kernel(
   const int newest_slot = HOT_BUFFER_SIZE;
   const int32_t newest_token = seq_len - 1;
 
+  // Each phase loads a group of a thread's elements before using any, so the group's cold global loads overlap;
+  // groups of at most GROUP elements keep the register arrays small for any buffer or top-k size.
+  constexpr int GROUP = 4;
+  constexpr int BUFFER_CHUNKS_PER_WARP = (NUM_BUFFER_CHUNKS + NUM_WARPS - 1) / NUM_WARPS;
+  constexpr int BUFFER_GROUP = (BUFFER_CHUNKS_PER_WARP < GROUP) ? BUFFER_CHUNKS_PER_WARP : GROUP;
+  constexpr int BUFFER_ROUNDS = (BUFFER_CHUNKS_PER_WARP + BUFFER_GROUP - 1) / BUFFER_GROUP;
+  int16_t lru_slot[BUFFER_GROUP];
+  int32_t lru_token[BUFFER_GROUP];
+  // Round r reads chunks warp_id + (r * BUFFER_GROUP + g) * NUM_WARPS, a contiguous run of chunks per round.
+  auto load_lru_round = [&](int round) {
+#pragma unroll
+    for (int g = 0; g < BUFFER_GROUP; ++g) {
+      const int slot_idx = (warp_id + (round * BUFFER_GROUP + g) * NUM_WARPS) * WARP_SIZE + lane_id;
+      lru_slot[g] = (slot_idx < HOT_BUFFER_SIZE) ? req_lru_slots[slot_idx] : static_cast<int16_t>(-1);
+    }
+#pragma unroll
+    for (int g = 0; g < BUFFER_GROUP; ++g) {
+      lru_token[g] = (lru_slot[g] >= 0) ? req_device_buffer_tokens[lru_slot[g]] : -1;
+    }
+  };
+  // The first round's LRU slots and their tokens do not depend on the top-k, so load them before the hash insert.
+  load_lru_round(0);
+
   // Insert top-k tokens into shared-memory hash table.
-  for (int i = tid; i < NUM_TOP_K_TOKENS; i += BLOCK_SIZE) {
-    const int32_t token_idx = resolve_selected_token<SPARSE_BLOCK_SIZE, TopKIsBlocks>(req_top_k, i);
-    if constexpr (TopKIsBlocks || PassThroughDeviceLocs) {
-      if (token_idx < 0 || token_idx >= seq_len) {
-        s_top_k_tokens[i] = TOKEN_HIT;
-        req_top_k_device_locs[i] = -1;
-        continue;
-      }
+  constexpr int TOKENS_PER_THREAD = (NUM_TOP_K_TOKENS + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  constexpr int TOKEN_GROUP = (TOKENS_PER_THREAD < GROUP) ? TOKENS_PER_THREAD : GROUP;
+  for (int k0 = 0; k0 < TOKENS_PER_THREAD; k0 += TOKEN_GROUP) {
+    int32_t top_k_token[TOKEN_GROUP];
+    int32_t pool_loc[TOKEN_GROUP];
+#pragma unroll
+    for (int g = 0; g < TOKEN_GROUP; ++g) {
+      const int i = tid + (k0 + g) * BLOCK_SIZE;
+      top_k_token[g] =
+          (i < NUM_TOP_K_TOKENS) ? resolve_selected_token<SPARSE_BLOCK_SIZE, TopKIsBlocks>(req_top_k, i) : -1;
     }
-    if constexpr (PassThroughDeviceLocs) {
-      const int32_t pool_loc = req_device_locs[token_idx];
-      if (pool_loc >= 0) {
-        s_top_k_tokens[i] = TOKEN_HIT;
-        req_top_k_device_locs[i] = pool_loc;
-        continue;
-      }
-    }
-    if (!PassThroughDeviceLocs && token_idx == newest_token) {
-      // If topk includes the latest token, bind its canonical occurrence to newest_slot (at HOT_BUFFER_SIZE) and mark
-      // it as a hit. newest_slot is at the first position of the extra page, excluded from LRU tracking.
-      s_top_k_tokens[i] = TOKEN_HIT;
-      req_top_k_device_locs[i] = req_device_buffer_locs[newest_slot];
-    } else {
-      int slot = hash_slot(token_idx, HASH_SIZE);
-      while (true) {
-        int32_t old = atomicCAS(&s_hash_keys[slot], HASH_EMPTY, token_idx);
-        if (old == HASH_EMPTY || old == token_idx) {
-          s_hash_vals[slot] = static_cast<int16_t>(i);
-          break;
+#pragma unroll
+    for (int g = 0; g < TOKEN_GROUP; ++g) {
+      pool_loc[g] = -1;
+      if constexpr (PassThroughDeviceLocs) {
+        if (top_k_token[g] >= 0 && top_k_token[g] < seq_len) {
+          pool_loc[g] = req_device_locs[top_k_token[g]];
         }
-        slot = (slot + 1) % HASH_SIZE;
       }
-      s_top_k_tokens[i] = token_idx;
     }
-  }
-  __syncthreads();
-
-  constexpr int ITERATIONS_PER_WARP_BUFFER = (NUM_BUFFER_CHUNKS + NUM_WARPS - 1) / NUM_WARPS;
-  int total_hit_count = 0;
-  int total_evict_count = 0;
-  for (int iter = 0; iter < ITERATIONS_PER_WARP_BUFFER; iter++) {
-    int chunk_idx = warp_id + iter * NUM_WARPS;
-    bool has_valid_chunk = chunk_idx < NUM_BUFFER_CHUNKS;
-
-    const int slot_idx = chunk_idx * WARP_SIZE + lane_id;
-    const bool has_valid_slot = has_valid_chunk && (slot_idx < HOT_BUFFER_SIZE);
-    const int16_t buf_slot = has_valid_slot ? req_lru_slots[slot_idx] : -1;
-    int32_t my_buffer_token = (buf_slot >= 0) ? req_device_buffer_tokens[buf_slot] : -1;
-    int my_found_top_k_idx = -1;
-    if (my_buffer_token >= 0) {
-      int h = hash_slot(my_buffer_token, HASH_SIZE);
-      while (true) {
-        int32_t k = s_hash_keys[h];
-        if (k == my_buffer_token) {
-          my_found_top_k_idx = static_cast<int32_t>(s_hash_vals[h]);
-          break;
+#pragma unroll
+    for (int g = 0; g < TOKEN_GROUP; ++g) {
+      const int i = tid + (k0 + g) * BLOCK_SIZE;
+      if (i >= NUM_TOP_K_TOKENS) continue;
+      const int32_t token_idx = top_k_token[g];
+      if constexpr (TopKIsBlocks || PassThroughDeviceLocs) {
+        if (token_idx < 0 || token_idx >= seq_len) {
+          s_top_k_tokens[i] = TOKEN_HIT;
+          req_top_k_device_locs[i] = -1;
+          continue;
         }
-        if (k == HASH_EMPTY) break;
-        h = (h + 1) % HASH_SIZE;
       }
-    }
-    bool is_hit = my_found_top_k_idx >= 0;
-    bool is_evictable = has_valid_slot && !is_hit;
-
-    // Record hits
-    if (is_hit) {
-      s_top_k_tokens[my_found_top_k_idx] = TOKEN_HIT;
-      req_top_k_device_locs[my_found_top_k_idx] = req_device_buffer_locs[buf_slot];
-    }
-
-    int local_hit_offset = 0;
-    int local_evict_offset = 0;
-    if (has_valid_chunk) {
-      const BallotMask hit_mask = __ballot_sync(FULL_WARP_MASK, is_hit);
-      const BallotMask evict_mask = __ballot_sync(FULL_WARP_MASK, is_evictable);
-      local_hit_offset = popc_mask(hit_mask & lanes_before);
-      local_evict_offset = popc_mask(evict_mask & lanes_before);
-      if (lane_id == 0) {
-        s_chunk_offset[chunk_idx + 1] = popc_mask(hit_mask);
-        s_evict_chunk_offset[chunk_idx + 1] = popc_mask(evict_mask);
+      if constexpr (PassThroughDeviceLocs) {
+        if (pool_loc[g] >= 0) {
+          s_top_k_tokens[i] = TOKEN_HIT;
+          req_top_k_device_locs[i] = pool_loc[g];
+          continue;
+        }
       }
-    }
-    __syncthreads();
-
-    if (warp_id == 0) {
-#ifdef USE_ROCM
-      // ROCm wavefront64: WARP_SIZE (64) > NUM_WARPS (16 at block_size=1024),
-      // so the wide-count form below would let lanes beyond this iteration's
-      // NUM_WARPS-wide window write the accumulator into s_chunk_offset
-      // positions belonging to future iterations, corrupting their reads.
-      // Bound the scan window to NUM_WARPS lanes.
-      const int scan_offset = iter * NUM_WARPS + 1;
-      const int scan_count = min(scan_offset + NUM_WARPS, NUM_BUFFER_CHUNKS + 1);
-      total_hit_count = warp_inclusive_scan(s_chunk_offset, lane_id, scan_offset, scan_count, total_hit_count);
-      total_evict_count =
-          warp_inclusive_scan(s_evict_chunk_offset, lane_id, scan_offset, scan_count, total_evict_count);
-#else
-      total_hit_count =
-          warp_inclusive_scan(s_chunk_offset, lane_id, chunk_idx + 1, NUM_BUFFER_CHUNKS + 1, total_hit_count);
-      total_evict_count =
-          warp_inclusive_scan(s_evict_chunk_offset, lane_id, chunk_idx + 1, NUM_BUFFER_CHUNKS + 1, total_evict_count);
-#endif
-      if (tid == 0) {
-        s_total_hits = total_hit_count;
+      if (!PassThroughDeviceLocs && token_idx == newest_token) {
+        // If topk includes the latest token, bind its canonical occurrence to newest_slot (at HOT_BUFFER_SIZE) and
+        // mark it as a hit. newest_slot is at the first position of the extra page, excluded from LRU tracking.
+        s_top_k_tokens[i] = TOKEN_HIT;
+        req_top_k_device_locs[i] = req_device_buffer_locs[newest_slot];
+      } else {
+        int slot = hash_slot(token_idx, HASH_SIZE);
+        while (true) {
+          int32_t old = atomicCAS(&s_hash_keys[slot], HASH_EMPTY, token_idx);
+          if (old == HASH_EMPTY || old == token_idx) {
+            s_hash_vals[slot] = static_cast<int16_t>(i);
+            break;
+          }
+          slot = (slot + 1) % HASH_SIZE;
+        }
+        s_top_k_tokens[i] = token_idx;
       }
-    }
-    __syncthreads();
-
-    // Hits grow forward from index 0
-    if (is_hit) {
-      int hit_offset = s_chunk_offset[chunk_idx] + local_hit_offset;
-      s_lru_slots_out[hit_offset] = buf_slot;
-    }
-    // Evictables grow backward from HOT_BUFFER_SIZE - 1
-    if (is_evictable) {
-      int evict_offset = s_evict_chunk_offset[chunk_idx] + local_evict_offset;
-      s_lru_slots_out[HOT_BUFFER_SIZE - 1 - evict_offset] = buf_slot;
     }
   }
   __syncthreads();
 
-  // Reset offsets for the miss counting phase (only NUM_TOKEN_CHUNKS + 1 entries needed).
-  for (int i = tid; i < NUM_TOKEN_CHUNKS + 1; i += BLOCK_SIZE) {
-    s_chunk_offset[i] = 0;
+  // Classify every LRU slot as a hit or evictable and compact both in LRU order: hits forward from index 0,
+  // evictables backward from HOT_BUFFER_SIZE - 1. Each round counts its chunks, then warp 0 scans those counts.
+  int hits = 0;
+  int evictables = 0;
+  for (int round = 0; round < BUFFER_ROUNDS; ++round) {
+    if (round > 0) {
+      load_lru_round(round);
+    }
+    int lru_hit[BUFFER_GROUP];
+    int32_t hit_loc[BUFFER_GROUP];
+    int hit_rank[BUFFER_GROUP];
+    int evict_rank[BUFFER_GROUP];
+#pragma unroll
+    for (int g = 0; g < BUFFER_GROUP; ++g) {
+      lru_hit[g] = -1;
+      if (lru_token[g] >= 0) {
+        int h = hash_slot(lru_token[g], HASH_SIZE);
+        while (true) {
+          int32_t key = s_hash_keys[h];
+          if (key == lru_token[g]) {
+            lru_hit[g] = static_cast<int32_t>(s_hash_vals[h]);
+            break;
+          }
+          if (key == HASH_EMPTY) break;
+          h = (h + 1) % HASH_SIZE;
+        }
+      }
+    }
+#pragma unroll
+    for (int g = 0; g < BUFFER_GROUP; ++g) {
+      hit_loc[g] = (lru_hit[g] >= 0) ? req_device_buffer_locs[lru_slot[g]] : -1;
+    }
+#pragma unroll
+    for (int g = 0; g < BUFFER_GROUP; ++g) {
+      const int chunk_idx = warp_id + (round * BUFFER_GROUP + g) * NUM_WARPS;
+      const bool is_hit = lru_hit[g] >= 0;
+      const bool is_evictable = !is_hit && chunk_idx * WARP_SIZE + lane_id < HOT_BUFFER_SIZE;
+      if (is_hit) {
+        s_top_k_tokens[lru_hit[g]] = TOKEN_HIT;
+        req_top_k_device_locs[lru_hit[g]] = hit_loc[g];
+      }
+      hit_rank[g] = 0;
+      evict_rank[g] = 0;
+      if (chunk_idx < NUM_BUFFER_CHUNKS) {
+        const BallotMask hit_mask = __ballot_sync(FULL_WARP_MASK, is_hit);
+        const BallotMask evict_mask = __ballot_sync(FULL_WARP_MASK, is_evictable);
+        hit_rank[g] = popc_mask(hit_mask & lanes_before);
+        evict_rank[g] = popc_mask(evict_mask & lanes_before);
+        if (lane_id == 0) {
+          s_chunk_offset[chunk_idx + 1] = popc_mask(hit_mask);
+          s_evict_chunk_offset[chunk_idx + 1] = popc_mask(evict_mask);
+        }
+      }
+    }
+    __syncthreads();
+    if (warp_id == 0) {
+      const int first = round * BUFFER_GROUP * NUM_WARPS + 1;
+      const int end = (first + BUFFER_GROUP * NUM_WARPS < NUM_BUFFER_CHUNKS + 1) ? first + BUFFER_GROUP * NUM_WARPS
+                                                                                 : NUM_BUFFER_CHUNKS + 1;
+      for (int f = first; f < end; f += WARP_SIZE) {
+        hits = warp_inclusive_scan(s_chunk_offset, lane_id, f, end, hits);
+        evictables = warp_inclusive_scan(s_evict_chunk_offset, lane_id, f, end, evictables);
+      }
+      if (lane_id == 0) {
+        s_total_hits = hits;
+      }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int g = 0; g < BUFFER_GROUP; ++g) {
+      const int chunk_idx = warp_id + (round * BUFFER_GROUP + g) * NUM_WARPS;
+      if (lru_hit[g] >= 0) {
+        s_lru_slots_out[s_chunk_offset[chunk_idx] + hit_rank[g]] = lru_slot[g];
+      } else if (chunk_idx * WARP_SIZE + lane_id < HOT_BUFFER_SIZE) {
+        s_lru_slots_out[HOT_BUFFER_SIZE - 1 - (s_evict_chunk_offset[chunk_idx] + evict_rank[g])] = lru_slot[g];
+      }
+    }
   }
   __syncthreads();
 
-  // Third pass to identify misses and their evictable slots
-  int total_misses = 0;
-  constexpr int ITERATIONS_PER_WARP_TOKEN = (NUM_TOKEN_CHUNKS + NUM_WARPS - 1) / NUM_WARPS;
-  for (int iter = 0; iter < ITERATIONS_PER_WARP_TOKEN; iter++) {
-    int chunk_idx = warp_id + iter * NUM_WARPS;
-    bool has_valid_chunk = chunk_idx < NUM_TOKEN_CHUNKS;
-
-    const int chunk_token_start = chunk_idx * WARP_SIZE;
-    const int my_token_idx = chunk_token_start + lane_id;
-    const bool has_valid_token = has_valid_chunk && (my_token_idx < NUM_TOP_K_TOKENS);
-
-    int32_t my_token = 0;
-    bool is_miss = false;
-    int local_miss_offset = 0;
-
-    if (has_valid_token) {
-      is_miss = s_top_k_tokens[my_token_idx] != TOKEN_HIT;
-      if (is_miss) {
-        my_token = s_top_k_tokens[my_token_idx];
-      }
-    }
-
-    if (has_valid_chunk) {
-      const BallotMask miss_mask = __ballot_sync(FULL_WARP_MASK, is_miss);
-      local_miss_offset = popc_mask(miss_mask & lanes_before);
-      const int warp_miss_count = popc_mask(miss_mask);
-      if (lane_id == 0) {
-        s_chunk_offset[chunk_idx + 1] = warp_miss_count;
+  // The i-th miss in top-k order takes the i-th evictable slot, least recently used first. Each round counts its
+  // token chunks, warp 0 scans the counts, then the round's misses take their slots.
+  constexpr int TOKEN_CHUNKS_PER_WARP = (NUM_TOKEN_CHUNKS + NUM_WARPS - 1) / NUM_WARPS;
+  constexpr int TOKEN_CHUNK_GROUP = (TOKEN_CHUNKS_PER_WARP < GROUP) ? TOKEN_CHUNKS_PER_WARP : GROUP;
+  constexpr int TOKEN_ROUNDS = (TOKEN_CHUNKS_PER_WARP + TOKEN_CHUNK_GROUP - 1) / TOKEN_CHUNK_GROUP;
+  int misses = 0;
+  for (int round = 0; round < TOKEN_ROUNDS; ++round) {
+    int32_t chunk_token[TOKEN_CHUNK_GROUP];
+    int miss_rank[TOKEN_CHUNK_GROUP];
+#pragma unroll
+    for (int g = 0; g < TOKEN_CHUNK_GROUP; ++g) {
+      const int chunk_idx = warp_id + (round * TOKEN_CHUNK_GROUP + g) * NUM_WARPS;
+      const int token_idx = chunk_idx * WARP_SIZE + lane_id;
+      chunk_token[g] = (token_idx < NUM_TOP_K_TOKENS) ? s_top_k_tokens[token_idx] : TOKEN_HIT;
+      miss_rank[g] = 0;
+      if (chunk_idx < NUM_TOKEN_CHUNKS) {
+        const BallotMask miss_mask = __ballot_sync(FULL_WARP_MASK, chunk_token[g] != TOKEN_HIT);
+        miss_rank[g] = popc_mask(miss_mask & lanes_before);
+        if (lane_id == 0) {
+          s_chunk_offset[chunk_idx + 1] = popc_mask(miss_mask);
+        }
       }
     }
     __syncthreads();
-
     if (warp_id == 0) {
-#ifdef USE_ROCM
-      const int scan_offset = iter * NUM_WARPS + 1;
-      const int scan_count = min(scan_offset + NUM_WARPS, NUM_TOKEN_CHUNKS + 1);
-      total_misses = warp_inclusive_scan(s_chunk_offset, lane_id, scan_offset, scan_count, total_misses);
-#else
-      total_misses = warp_inclusive_scan(s_chunk_offset, lane_id, chunk_idx + 1, NUM_TOKEN_CHUNKS + 1, total_misses);
-#endif
-      if (tid == 0) {
-        s_total_misses = total_misses;
+      const int first = round * TOKEN_CHUNK_GROUP * NUM_WARPS + 1;
+      const int end = (first + TOKEN_CHUNK_GROUP * NUM_WARPS < NUM_TOKEN_CHUNKS + 1)
+                          ? first + TOKEN_CHUNK_GROUP * NUM_WARPS
+                          : NUM_TOKEN_CHUNKS + 1;
+      for (int f = first; f < end; f += WARP_SIZE) {
+        misses = warp_inclusive_scan(s_chunk_offset, lane_id, f, end, misses);
+      }
+      if (lane_id == 0) {
+        s_total_misses = misses;
       }
     }
     __syncthreads();
-
-    if (is_miss) {
-      int miss_offset = s_chunk_offset[chunk_idx] + local_miss_offset;
-      int16_t evict_slot = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - miss_offset];
-      // Reuse s_top_k_tokens as miss scratch: miss_offset < my_token_idx always
-      // holds (hits are skipped), so compacted writes never overrun pending reads.
-      s_top_k_tokens[miss_offset] = my_token;
-      req_top_k_device_locs[my_token_idx] = req_device_buffer_locs[evict_slot];
-      req_device_buffer_tokens[evict_slot] = my_token;
+    // This round's s_top_k_tokens reads finished before the barrier, and each miss is compacted to an index no
+    // larger than its own token, below the next round's first token; so the array can hold the compacted misses.
+#pragma unroll
+    for (int g = 0; g < TOKEN_CHUNK_GROUP; ++g) {
+      if (chunk_token[g] == TOKEN_HIT) continue;
+      const int chunk_idx = warp_id + (round * TOKEN_CHUNK_GROUP + g) * NUM_WARPS;
+      const int miss_offset = s_chunk_offset[chunk_idx] + miss_rank[g];
+      const int16_t evict_slot = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - miss_offset];
+      const int32_t evict_loc = req_device_buffer_locs[evict_slot];
+      s_top_k_tokens[miss_offset] = chunk_token[g];
+      req_top_k_device_locs[chunk_idx * WARP_SIZE + lane_id] = evict_loc;
+      req_device_buffer_tokens[evict_slot] = chunk_token[g];
       // Record the plan where the eviction is decided so it cannot disagree
       // with the copy phase; locs are layer-independent (lockstep buffers).
       if constexpr (RecordMissPlan) {
-        miss_src_out[bid * plan_stride + miss_offset] = req_host_cache_locs[my_token];
-        miss_dst_out[bid * plan_stride + miss_offset] = req_device_buffer_locs[evict_slot];
+        miss_src_out[bid * plan_stride + miss_offset] = req_host_cache_locs[chunk_token[g]];
+        miss_dst_out[bid * plan_stride + miss_offset] = evict_loc;
       }
     }
   }
   __syncthreads();
 
-  total_misses = s_total_misses;
+  const int total_misses = s_total_misses;
   if constexpr (RecordMissPlan) {
     if (tid == 0) {
       miss_count_out[bid] = total_misses;

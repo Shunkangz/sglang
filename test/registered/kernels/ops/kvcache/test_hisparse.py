@@ -1,5 +1,6 @@
 import sys
 
+import numpy as np
 import pytest
 import torch
 
@@ -970,6 +971,163 @@ def test_load_cache_to_device_buffer_batched_with_padding() -> None:
     )
     assert torch.equal(state["lru_slots"][2].cpu(), padded_lru_before.cpu())
     assert torch.equal(state["device_buffer"][9].cpu(), state["host_cache"][6])
+
+
+def _lru_reference(
+    *,
+    top_k: np.ndarray,
+    rid: int,
+    seq_len: int,
+    buffer_tokens: np.ndarray,
+    buffer_locs: np.ndarray,
+    lru: np.ndarray,
+    host_locs: np.ndarray,
+    device_locs: np.ndarray | None,
+) -> tuple:
+    hot = lru.shape[1]
+    tokens = buffer_tokens[rid].copy()
+    locs = buffer_locs[rid]
+    out = np.full(len(top_k), -1, dtype=np.int32)
+    wanted = {}
+    for i, token in enumerate(top_k.tolist()):
+        if device_locs is not None:
+            if not 0 <= token < seq_len:
+                continue
+            if device_locs[rid, token] >= 0:
+                out[i] = device_locs[rid, token]
+                continue
+        elif token == seq_len - 1:
+            out[i] = locs[hot]
+            continue
+        wanted[token] = i
+    hits, evictable = [], []
+    for slot in lru[rid].tolist():
+        token = int(tokens[slot])
+        if token >= 0 and token in wanted:
+            out[wanted.pop(token)] = locs[slot]
+            hits.append(slot)
+        else:
+            evictable.append(slot)
+    misses = sorted(wanted.values())
+    plan_src, plan_dst = [], []
+    for m, i in enumerate(misses):
+        slot = evictable[m]
+        out[i] = locs[slot]
+        tokens[slot] = top_k[i]
+        plan_src.append(host_locs[rid, top_k[i]])
+        plan_dst.append(locs[slot])
+    new_lru = evictable[len(misses) :] + evictable[: len(misses)] + hits
+    return out, tokens, np.array(new_lru, dtype=np.int16), plan_src, plan_dst
+
+
+@_requires_shared_sources
+# 256 threads: two rounds per phase. 1024 threads: the tightest register budget.
+# 960 threads, 8192 slots, 2048 tokens: three slot rounds and two-call token scans.
+@pytest.mark.parametrize(
+    "block_size,pass_through,hot,num_top_k",
+    [(256, False, 2048, 2048), (1024, True, 2048, 1024), (960, True, 8192, 2048)],
+)
+def test_swap_in_matches_an_lru_reference_across_many_chunks(
+    block_size: int, pass_through: bool, hot: int, num_top_k: int
+) -> None:
+    """Hits, evictions, the new LRU order and the miss plan must match a reference model
+    when every warp scans several 32-slot chunks of the hot buffer and the top-k."""
+    seq_len, reqs, num_hits = 20000, 3, 300
+    rng = np.random.default_rng(block_size)
+    rows = reqs + 1  # one table row no request uses
+    rids = rng.permutation(rows)[:reqs]
+    host_locs = np.stack([rng.permutation(seq_len) + r * seq_len for r in range(rows)])
+    buffer_locs = np.stack(
+        [rng.permutation(hot + 1) + r * (hot + 1) for r in range(rows)]
+    ).astype(np.int32)
+    buffer_tokens = np.full((rows, hot + 1), -1, dtype=np.int32)
+    lru = np.stack([rng.permutation(hot) for _ in range(rows)]).astype(np.int16)
+    device_locs = np.full((rows, seq_len), -1, dtype=np.int32)
+    top_k = np.empty((reqs, num_top_k), dtype=np.int32)
+    for b, rid in enumerate(rids.tolist()):
+        # 37 slots stay empty; the newest token sits in the extra slot.
+        resident = rng.choice(seq_len - 1, size=hot - 37, replace=False)
+        buffer_tokens[rid, rng.permutation(hot)[: hot - 37]] = resident
+        buffer_tokens[rid, hot] = seq_len - 1
+        others = rng.permutation(np.setdiff1d(np.arange(seq_len - 1), resident))
+        hits = rng.choice(resident, size=num_hits, replace=False)
+        if pass_through:
+            # 100 pool-resident positions and 24 invalid entries; the rest miss.
+            misses = num_top_k - num_hits - 124
+            pooled = others[misses : misses + 100]
+            device_locs[rid, pooled] = rng.integers(0, 1 << 20, size=len(pooled))
+            row = np.concatenate([hits, others[:misses], pooled, np.full(24, -1)])
+        else:
+            misses = num_top_k - num_hits - 1
+            row = np.concatenate([hits, others[:misses], [seq_len - 1]])
+        top_k[b] = rng.permutation(row)
+
+    host = torch.empty((rows * seq_len, 1, KV_DIM), dtype=DTYPE, pin_memory=True)
+    host.copy_(torch.arange(host.numel(), dtype=DTYPE).view_as(host))
+    device_buffer = torch.full(
+        (rows * (hot + 1), 1, KV_DIM), -1, dtype=DTYPE, device=DEVICE
+    )
+    tokens_t = torch.from_numpy(buffer_tokens).to(DEVICE)
+    lru_t = torch.from_numpy(lru).to(DEVICE)
+    out = torch.full((reqs, num_top_k), -2, dtype=torch.int32, device=DEVICE)
+    miss_src = torch.full((reqs, num_top_k), -1, dtype=torch.int64, device=DEVICE)
+    miss_dst = torch.full((reqs, num_top_k), -1, dtype=torch.int32, device=DEVICE)
+    miss_count = torch.full((reqs,), -1, dtype=torch.int32, device=DEVICE)
+    source = {"host_cache": host}
+    if pass_through:
+        source = {
+            "host_cache": None,
+            "device_locs": torch.from_numpy(device_locs).to(DEVICE),
+            "host_binding": torch.tensor(
+                [host.data_ptr(), ITEM_SIZE_BYTES], dtype=torch.int64, device=DEVICE
+            ),
+        }
+    load_cache_to_device_buffer_mla(
+        top_k_tokens=torch.from_numpy(top_k).to(DEVICE),
+        device_buffer_tokens=tokens_t,
+        host_cache_locs=torch.from_numpy(host_locs).to(DEVICE),
+        device_buffer_locs=torch.from_numpy(buffer_locs).to(DEVICE),
+        device_buffer=device_buffer,
+        top_k_device_locs=out,
+        req_pool_indices=torch.from_numpy(rids).to(DEVICE),
+        seq_lens=torch.full((reqs,), seq_len, dtype=torch.int32, device=DEVICE),
+        lru_slots=lru_t,
+        item_size_bytes=ITEM_SIZE_BYTES,
+        num_top_k=num_top_k,
+        hot_buffer_size=hot,
+        page_size=1,
+        block_size=block_size,
+        num_real_reqs=torch.tensor([reqs], dtype=torch.int32, device=DEVICE),
+        miss_src=miss_src,
+        miss_dst=miss_dst,
+        miss_count=miss_count,
+        **source,
+    )
+    get_device_module().synchronize()
+
+    for b, rid in enumerate(rids.tolist()):
+        want_out, want_tokens, want_lru, plan_src, plan_dst = _lru_reference(
+            top_k=top_k[b],
+            rid=rid,
+            seq_len=seq_len,
+            buffer_tokens=buffer_tokens,
+            buffer_locs=buffer_locs,
+            lru=lru,
+            host_locs=host_locs,
+            device_locs=device_locs if pass_through else None,
+        )
+        assert np.array_equal(out[b].cpu().numpy(), want_out), f"request {b}: slots"
+        assert np.array_equal(tokens_t[rid].cpu().numpy(), want_tokens), f"request {b}"
+        assert np.array_equal(lru_t[rid].cpu().numpy(), want_lru), f"request {b}: LRU"
+        m = len(plan_src)
+        assert miss_count[b].item() == m, f"request {b}: miss count"
+        assert miss_src[b, :m].tolist() == plan_src, f"request {b}: plan sources"
+        assert miss_dst[b, :m].tolist() == plan_dst, f"request {b}: plan targets"
+        copied = device_buffer[torch.tensor(plan_dst, device=DEVICE).long(), 0].cpu()
+        assert torch.equal(copied, host[torch.tensor(plan_src).long(), 0])
+    unused = int(np.setdiff1d(np.arange(rows), rids)[0])
+    assert np.array_equal(tokens_t[unused].cpu().numpy(), buffer_tokens[unused])
+    assert np.array_equal(lru_t[unused].cpu().numpy(), lru[unused])
 
 
 def test_load_cache_to_device_buffer_dsv4_mla_miss_copy_layout() -> None:
